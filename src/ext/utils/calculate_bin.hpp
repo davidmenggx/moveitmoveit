@@ -3,8 +3,8 @@
 #include <cstdint>
 
 // Calculates the tightest bin size in the segregated free list whose block size
-// is at least capacity (object count, not byte count). Returns -1 when the bin
-// size exceeds the maximum bin size.
+// is at least `capacity` bytes. Returns -1 when `capacity` exceeds the maximum
+// bin size.
 [[nodiscard]] inline int
 calculate_bin(uint64_t capacity, const int SMALLEST_BIN, const int NUM_BINS) {
   if (capacity == 0) [[unlikely]]

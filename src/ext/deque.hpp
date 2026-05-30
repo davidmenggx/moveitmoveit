@@ -7,11 +7,12 @@
 #include <cstdint>
 #include <string>
 
+namespace moveitmoveit {
 #if defined(__cpp_lib_hardware_interference_size)
-constexpr std::size_t CACHE_LINE_SIZE =
+inline constexpr std::size_t CACHE_LINE_SIZE =
     std::hardware_destructive_interference_size;
 #else
-constexpr std::size_t CACHE_LINE_SIZE = 64;
+inline constexpr std::size_t CACHE_LINE_SIZE = 64;
 #endif
 
 enum class DequeStatus : uint32_t { Ok, Empty, Abort };
@@ -27,8 +28,8 @@ struct ObjectDescriptor {
 
 // Deque state constants
 inline constexpr int64_t MAX_BUFFERS = 64;
-constexpr ObjectDescriptor EMPTY{0, 0, 0, DequeStatus::Empty};
-constexpr ObjectDescriptor ABORT{0, 0, 0, DequeStatus::Abort};
+inline constexpr ObjectDescriptor EMPTY{0, 0, 0, DequeStatus::Empty};
+inline constexpr ObjectDescriptor ABORT{0, 0, 0, DequeStatus::Abort};
 
 // Structure and algorithms inspired by David Chase and Yossi Lev, 2005.
 struct alignas(CACHE_LINE_SIZE) Buffer {
@@ -40,9 +41,9 @@ struct alignas(CACHE_LINE_SIZE) Buffer {
 };
 
 // Memory allocation constants
-constexpr int NULL_OFFSET{0};
-constexpr int MIN_FREE_LIST_BIN_SIZE{6};
-constexpr int NUM_FREE_LIST_BINS{30};
+inline constexpr int NULL_OFFSET{0};
+inline constexpr int MIN_FREE_LIST_BIN_SIZE{6};
+inline constexpr int NUM_FREE_LIST_BINS{25}; // Buckets from 64 bytes => 1 GB
 
 // Contains memory offsets for each of the buffers.
 struct Registry {
@@ -55,6 +56,8 @@ struct Registry {
     uint32_t offset_;
     uint32_t aba_tag_;
   };
+  static_assert(std::atomic<TaggedOffset>::is_always_lock_free,
+                "TaggedOffset must be strictly lock-free for IPC");
 
   struct alignas(64) PaddedFreeList {
     std::atomic<TaggedOffset> head_{TaggedOffset{0, 0}};
@@ -63,14 +66,14 @@ struct Registry {
   // Segregated free list
   PaddedFreeList free_lists_[NUM_FREE_LIST_BINS];
 
-  alignas(CACHE_LINE_SIZE) uint64_t buffer_offsets_[MAX_BUFFERS];
+  alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> buffer_offsets_[MAX_BUFFERS];
   std::atomic<uint32_t> initialized_flag_{0};
 };
 
 // Constructor retry constants
-constexpr int MAX_FTRUNCATE_TRIES{50};
-constexpr int MAX_REGISTRY_INIT_TRIES{200};
-constexpr int SLEEP_US{1'000};
+inline constexpr int MAX_FTRUNCATE_TRIES{50};
+inline constexpr int MAX_REGISTRY_INIT_TRIES{200};
+inline constexpr int SLEEP_US{1'000};
 
 class Deque {
 public:
@@ -99,6 +102,9 @@ public:
 
 private:
   void grow(int64_t current_capacity);
+
+  // Returns the byte offset of a memory block large enough for `capacity`
+  // bytes, or NULL_OFFSET (0) if out of memory or unsupported capacity.
   [[nodiscard]] uint64_t allocate(uint64_t capacity);
 
   // TODO: Shrink buffers down at low usage (requires more sophisticated
@@ -121,6 +127,8 @@ private:
                                  static_cast<char *>(base_address_));
   }
 
+  void cleanup() noexcept;
+
   std::string shm_name_{};
   int shm_fd_{-1};
   std::size_t segment_size_{0};
@@ -134,3 +142,4 @@ private:
 
   FastRNG rng_{};
 };
+} // namespace moveitmoveit
