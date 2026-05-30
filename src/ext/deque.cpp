@@ -42,7 +42,7 @@ Deque::Deque(std::string group_id, std::size_t default_size_mb)
     // Wait for the creator to set the memory using ftruncate.
     struct stat statbuf{};
     for (int i{0}; statbuf.st_size == 0; ++i) {
-      if (i >= MAX_FTRUNCATE_TRIES) {
+      if (i >= MAX_FTRUNCATE_RETRIES) {
         close(shm_fd_);
         throw std::runtime_error(
             "CRITICAL: Timed out waiting for creator to size the segment.");
@@ -69,16 +69,24 @@ Deque::Deque(std::string group_id, std::size_t default_size_mb)
     registry_ = new (base_address_) Registry();
     registry_->global_segement_size_.store(segment_size_,
                                            std::memory_order_relaxed);
-    queue_idx_ = registry_->num_active_processes_.fetch_add(
-        1, std::memory_order_relaxed);
+    queue_idx_ =
+        registry_->next_queue_idx_.fetch_add(1, std::memory_order_relaxed);
     registry_->initialized_flag_.store(1, std::memory_order_release);
   } else {
     Registry *temp_reg{reinterpret_cast<Registry *>(base_address_)};
-    while (registry_->initialized_flag_.load(std::memory_order_acquire) == 0)
+    for (int i{0};
+         temp_reg->initialized_flag_.load(std::memory_order_acquire) == 0;
+         ++i) {
+      if (i >= MAX_REGISTRY_RETRIES) {
+        cleanup();
+        throw std::runtime_error(
+            "CRITICAL: Timed out waiting for creator to open Registry");
+      }
       std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
     registry_ = temp_reg;
-    queue_idx_ = registry_->num_active_processes_.fetch_add(
-        1, std::memory_order_relaxed);
+    queue_idx_ =
+        registry_->next_queue_idx_.fetch_add(1, std::memory_order_relaxed);
   }
 
   if (queue_idx_ >= MAX_BUFFERS) {
@@ -92,8 +100,7 @@ Deque::Deque(std::string group_id, std::size_t default_size_mb)
   registry_->buffer_offsets_[queue_idx_] = buf_offset;
   my_buffer_ = new (offset_to_ptr<void>(buf_offset)) Buffer();
 
-  const uint64_t initial_capacity{
-      1 << MIN_FREE_LIST_BIN_CAP}; // Must be a power of 2
+  const uint64_t initial_capacity{1 << MIN_FREE_LIST_BIN_CAP};
   const uint64_t initial_buffer_offset{
       allocate(initial_capacity * sizeof(ObjectDescriptor))};
 
@@ -102,16 +109,22 @@ Deque::Deque(std::string group_id, std::size_t default_size_mb)
     throw std::runtime_error(
         "CRITICAL: Initial buffer allocation failed, out of memory.");
   }
-
   my_buffer_->buffer_capacity_.store(initial_capacity,
                                      std::memory_order_relaxed);
   my_buffer_->buffer_offset_.store(initial_buffer_offset,
                                    std::memory_order_relaxed);
 
+  registry_->num_active_processes_.fetch_add(1, std::memory_order_relaxed);
+  registry_->live_mask_.fetch_or(1ULL << queue_idx_, std::memory_order_release);
+
   rng_.seed(getpid());
 }
 
 Deque::~Deque() noexcept {
+  ebr_unpin();
+  registry_->live_mask_.fetch_and(~(1ULL << queue_idx_),
+                                  std::memory_order_release);
+
   const int64_t remaining{
       registry_->num_active_processes_.fetch_sub(1, std::memory_order_acq_rel) -
       1};
@@ -124,7 +137,7 @@ Deque::~Deque() noexcept {
 }
 
 [[nodiscard]] ObjectDescriptor Deque::write(const char *serialized_data,
-                                            std::size_t size) noexcept {
+                                            std::size_t size) {
   const uint64_t payload_offset{allocate(size)};
 
   if (payload_offset == NULL_OFFSET) [[unlikely]]
@@ -139,7 +152,7 @@ Deque::~Deque() noexcept {
                           .status_ = ObjectStatus::Ok};
 }
 
-bool Deque::push(const char *serialized_data, std::size_t size) noexcept {
+bool Deque::put(const char *serialized_data, std::size_t size) {
   const int64_t bottom{my_buffer_->bottom_.load(std::memory_order_relaxed)};
   const int64_t top{my_buffer_->top_.load(std::memory_order_acquire)};
   uint64_t capacity{
@@ -166,7 +179,7 @@ bool Deque::push(const char *serialized_data, std::size_t size) noexcept {
   return true;
 }
 
-bool Deque::try_push(const char *serialized_data, std::size_t size) noexcept {
+bool Deque::try_put(const char *serialized_data, std::size_t size) {
   const int64_t bottom{my_buffer_->bottom_.load(std::memory_order_relaxed)};
   const int64_t top{my_buffer_->top_.load(std::memory_order_acquire)};
   const uint64_t capacity{
@@ -190,7 +203,7 @@ bool Deque::try_push(const char *serialized_data, std::size_t size) noexcept {
   return true;
 }
 
-[[nodiscard]] ObjectDescriptor Deque::pop() noexcept {
+[[nodiscard]] ObjectDescriptor Deque::get() {
   int64_t bottom{my_buffer_->bottom_.load(std::memory_order_relaxed)};
   --bottom;
   my_buffer_->bottom_.store(bottom, std::memory_order_relaxed);
@@ -198,6 +211,9 @@ bool Deque::try_push(const char *serialized_data, std::size_t size) noexcept {
   std::atomic_thread_fence(std::memory_order_seq_cst);
 
   int64_t top{my_buffer_->top_.load(std::memory_order_relaxed)};
+
+  if (ebr_cycles_since_advance_++ >= EBR_CYCLE_FORCE_ADVANCE)
+    ebr_try_advance();
 
   if (top <= bottom) {
     // Deque is nonempty
@@ -226,30 +242,30 @@ bool Deque::try_push(const char *serialized_data, std::size_t size) noexcept {
   }
 }
 
-[[nodiscard]] ObjectDescriptor Deque::steal() noexcept {
-  const int64_t num_processes{
-      registry_->num_active_processes_.load(std::memory_order_acquire)};
-  if (num_processes <= 1)
+[[nodiscard]] ObjectDescriptor Deque::steal() {
+  uint64_t candidates = registry_->live_mask_.load(std::memory_order_acquire) &
+                        ~(1ULL << queue_idx_);
+  if (candidates == 0)
     return EMPTY;
 
-  // Chose a random victim (not ourself)
-  int64_t victim_idx{};
-  do {
-    victim_idx =
-        rng_.random<int64_t>(static_cast<int64_t>(0), num_processes - 1);
-  } while (victim_idx == queue_idx_);
+  const int num_candidates{std::popcount(candidates)};
+  const int pick{rng_.random<int>(0, num_candidates - 1)};
+  uint64_t temp{candidates};
+  for (int i{0}; i < pick; ++i)
+    temp &= temp - 1;
+  const int victim_idx{std::countr_zero(temp)};
 
   const uint64_t victim_buf_offset{registry_->buffer_offsets_[victim_idx]};
   auto *victim_buffer = offset_to_ptr<Buffer>(victim_buf_offset);
 
   int64_t top{victim_buffer->top_.load(std::memory_order_acquire)};
-
   std::atomic_thread_fence(std::memory_order_seq_cst);
-
   int64_t bottom{victim_buffer->bottom_.load(std::memory_order_acquire)};
 
   if (top >= bottom)
     return EMPTY;
+
+  ebr_pin();
 
   const uint64_t capacity{
       victim_buffer->buffer_capacity_.load(std::memory_order_acquire)};
@@ -257,13 +273,17 @@ bool Deque::try_push(const char *serialized_data, std::size_t size) noexcept {
       victim_buffer->buffer_offset_.load(std::memory_order_acquire)};
   auto *ring_buffer = offset_to_ptr<ObjectDescriptor>(ring_buffer_offset);
 
-  ObjectDescriptor item = ring_buffer[top & (capacity - 1)];
+  ObjectDescriptor item{ring_buffer[top & (capacity - 1)]};
 
-  if (!victim_buffer->top_.compare_exchange_strong(
-          top, top + 1, std::memory_order_seq_cst, std::memory_order_relaxed))
-    return ABORT;
+  const bool cas_ok{victim_buffer->top_.compare_exchange_strong(
+      top, top + 1, std::memory_order_seq_cst, std::memory_order_relaxed)};
 
-  return item;
+  ebr_unpin();
+
+  // TODO: Check if this is causing too much contention.
+  ebr_try_advance();
+
+  return cas_ok ? item : ABORT;
 }
 
 // TODO: Consier memory fragmentation issues
@@ -308,37 +328,71 @@ bool Deque::try_push(const char *serialized_data, std::size_t size) noexcept {
     if (registry_->unallocated_memory_top_.compare_exchange_weak(
             old_top, new_top, std::memory_order_relaxed,
             std::memory_order_relaxed)) {
-      return old_top;
+      return aligned_top;
     }
   }
 }
 
-// CRITICAL TODO: Ensure that we are recycling the memory of the old buffer.
-[[nodiscard]] bool Deque::grow(int64_t current_capacity) noexcept {
-  const uint64_t new_capacity{static_cast<uint64_t>(current_capacity * 2)};
+void Deque::free(uint64_t offset, uint64_t capacity) {
+  if (offset == NULL_OFFSET) [[unlikely]]
+    return;
+
+  const int bin_idx{
+      calculate_bin(capacity, MIN_FREE_LIST_BIN_CAP, NUM_FREE_LIST_BINS)};
+
+  // We try to free an amount of memory greater than the supported bins.
+  if (bin_idx < 0) [[unlikely]]
+    return;
+
+  auto *next_ptr = offset_to_ptr<std::atomic<uint32_t>>(offset);
+
+  Registry::TaggedOffset head{
+      registry_->free_lists_[bin_idx].head_.load(std::memory_order_relaxed)};
+
+  while (true) {
+    next_ptr->store(head.offset_, std::memory_order_relaxed);
+
+    Registry::TaggedOffset new_head{static_cast<uint32_t>(offset),
+                                    head.aba_tag_ + 1};
+
+    if (registry_->free_lists_[bin_idx].head_.compare_exchange_weak(
+            head, new_head, std::memory_order_release,
+            std::memory_order_relaxed))
+      break; // Successfully added to the free list
+  }
+}
+
+[[nodiscard]] bool Deque::grow(uint64_t current_capacity) {
+  const uint64_t old_offset{
+      my_buffer_->buffer_offset_.load(std::memory_order_relaxed)};
+  const uint64_t old_size{current_capacity * sizeof(ObjectDescriptor)};
+
+  const uint64_t new_capacity{current_capacity * 2};
   const uint64_t new_offset{allocate(new_capacity * sizeof(ObjectDescriptor))};
 
   if (new_offset == NULL_OFFSET) [[unlikely]]
-    return false; // Out of memory
+    return false;
 
-  auto *old_ring = offset_to_ptr<ObjectDescriptor>(
-      my_buffer_->buffer_offset_.load(std::memory_order_relaxed));
+  auto *old_ring = offset_to_ptr<ObjectDescriptor>(old_offset);
   auto *new_ring = offset_to_ptr<ObjectDescriptor>(new_offset);
 
   const int64_t bottom{my_buffer_->bottom_.load(std::memory_order_relaxed)};
   const int64_t top{my_buffer_->top_.load(std::memory_order_acquire)};
 
-  // Move the data over
   for (int64_t i{top}; i < bottom; ++i)
     new_ring[i & (new_capacity - 1)] = old_ring[i & (current_capacity - 1)];
 
   my_buffer_->buffer_offset_.store(new_offset, std::memory_order_release);
   my_buffer_->buffer_capacity_.store(new_capacity, std::memory_order_release);
 
+  ebr_retire(old_offset, old_size);
+  ebr_try_advance();
+  ebr_reclaim();
+
   return true;
 }
 
-void Deque::cleanup() noexcept {
+void Deque::cleanup() {
   if (registry_ != nullptr && queue_idx_ != -1) {
     registry_->num_active_processes_.fetch_sub(1, std::memory_order_relaxed);
     queue_idx_ = -1;
@@ -358,6 +412,58 @@ void Deque::cleanup() noexcept {
     shm_unlink(shm_name_.c_str());
     is_creator_ = false;
   }
+}
+
+void Deque::ebr_pin() {
+  uint64_t epoch{};
+  do {
+    epoch = registry_->global_epoch_.load(std::memory_order_acquire);
+    registry_->pinned_epochs_[queue_idx_].value_.store(
+        epoch, std::memory_order_seq_cst);
+  } while (registry_->global_epoch_.load(std::memory_order_acquire) != epoch);
+}
+
+void Deque::ebr_unpin() {
+  registry_->pinned_epochs_[queue_idx_].value_.store(Registry::EBR_UNPINNED,
+                                                     std::memory_order_release);
+}
+
+void Deque::ebr_retire(uint64_t offset, uint64_t size_bytes) {
+  const uint64_t epoch{
+      registry_->global_epoch_.load(std::memory_order_relaxed)};
+  retire_lists_[epoch % EBR_EPOCHS].push_back({offset, size_bytes});
+}
+
+bool Deque::ebr_try_advance() {
+  uint64_t global{registry_->global_epoch_.load(std::memory_order_acquire)};
+  uint64_t mask{registry_->live_mask_.load(std::memory_order_acquire)};
+
+  uint64_t temp{mask};
+  while (temp) {
+    const int idx = std::countr_zero(temp);
+    temp &= temp - 1;
+
+    const uint64_t pinned =
+        registry_->pinned_epochs_[idx].value_.load(std::memory_order_acquire);
+    if (pinned != Registry::EBR_UNPINNED && pinned != global)
+      return false; // Someone is still in a critical section at an older
+                    // epoch.
+  }
+
+  return registry_->global_epoch_.compare_exchange_strong(
+      global, global + 1, std::memory_order_acq_rel, std::memory_order_relaxed);
+}
+
+void Deque::ebr_reclaim() {
+  const uint64_t global{
+      registry_->global_epoch_.load(std::memory_order_relaxed)};
+  if (global < 2)
+    return; // Not enough epochs have elapsed yet.
+
+  auto &list = retire_lists_[(global - 2) % EBR_EPOCHS];
+  for (const auto &rb : list)
+    free(rb.offset_, rb.size_bytes_);
+  list.clear();
 }
 
 } // namespace moveitmoveit
