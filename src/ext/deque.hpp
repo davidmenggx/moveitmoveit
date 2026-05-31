@@ -5,44 +5,106 @@
 
 #include <array>
 #include <atomic>
+#include <bit>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
 
+static_assert(std::atomic<uint64_t>::is_always_lock_free,
+              "CRITICAL: std::atomic<uint64_t> must be lock-free");
+static_assert(std::atomic<int64_t>::is_always_lock_free,
+              "CRITICAL: std::atomic<int64_t> must be lock-free");
+
+// TODO: If 128 bits are atomic (e.g. __uint128_t), we should prefer that
+// instead of the current bit packing tricks.
+
 namespace moveitmoveit {
 inline constexpr std::size_t CACHE_LINE_SIZE = 64;
 
+// Note: Due to the need for atomic operations, we pack metadata into 64 bits.
+// This limits the amount of addressable shared memory to 1 TB.
+inline constexpr uint64_t SYSTEM_OFFSET_MASK = 0x000000FFFFFFFFFFULL;
+
 enum class ObjectStatus : uint32_t { Ok, Empty, Abort };
+
 // Metadata for deque objects to support type-agnostic-ness.
 struct ObjectDescriptor {
   uint64_t offset_{0};
-  uint32_t size_{0};
-  uint32_t padding_{0};
+  uint32_t size_{0}; // Maximum object size is u32 max, ~4GB.
   ObjectStatus status_{ObjectStatus::Ok};
 };
 
-// TODO: Consider a more performant implementation for single type.
+// TODO: Consider a more performant implementation for single type, such as
+// inlining the ObjectDescriptors.
+
+struct alignas(8) RingSlot {
+  std::atomic<uint64_t> data_{0};
+
+  void store(const ObjectDescriptor &d, std::memory_order mo) noexcept {
+    const uint64_t safe_offset{d.offset_ & SYSTEM_OFFSET_MASK};
+    const uint64_t safe_size{static_cast<uint64_t>(d.size_) & 0x3FFFFFULL};
+    const uint64_t safe_status{static_cast<uint64_t>(d.status_) & 0x3ULL};
+
+    const uint64_t packed{(safe_offset << 24) | (safe_size << 2) | safe_status};
+    data_.store(packed, mo);
+  }
+
+  [[nodiscard]] ObjectDescriptor load(std::memory_order mo) const noexcept {
+    const uint64_t packed{data_.load(mo)};
+
+    return ObjectDescriptor{.offset_ = packed >> 24,
+                            .size_ =
+                                static_cast<uint32_t>((packed >> 2) & 0x3FFFFF),
+                            .status_ = static_cast<ObjectStatus>(packed & 0x3)};
+  }
+};
+
+static_assert(sizeof(RingSlot) == 8);
 
 // Deque state constants
 inline constexpr int64_t MAX_BUFFERS = 64;
-// NOTE: We currently only support 64 total queue lifetimes (NOT concurrent
-// connections), perhaps re-use the queue indices in the Registry.
 
-inline constexpr ObjectDescriptor EMPTY{0, 0, 0, ObjectStatus::Empty};
-inline constexpr ObjectDescriptor ABORT{0, 0, 0, ObjectStatus::Abort};
+// NOTE: We currently only support 64 total queue lifetimes (NOT concurrent
+// connections), perhaps re-use the queue indices in the Registry. IMPORTANT
+// TODO: Make sure MAX_BUFFERS is actually a concurrent connection count, not a
+// lifetime count.
+
+inline constexpr ObjectDescriptor EMPTY{0, 0, ObjectStatus::Empty};
+inline constexpr ObjectDescriptor ABORT{0, 0, ObjectStatus::Abort};
+
+// Pack capacity (log2) in lowest 6 bits, since allocations are 64 bit aligned.
+struct PackedRingDescriptor {
+  static constexpr uint64_t TAG_MASK = 0x3FULL;
+  static constexpr uint64_t OFFSET_MASK = SYSTEM_OFFSET_MASK & ~TAG_MASK;
+  uint64_t data_{0};
+
+  constexpr PackedRingDescriptor() noexcept = default;
+  constexpr PackedRingDescriptor(uint64_t offset, uint64_t capacity) noexcept {
+    pack(offset, capacity);
+  }
+
+  constexpr void pack(uint64_t offset, uint64_t capacity) noexcept {
+    const uint64_t cap_log2{static_cast<uint64_t>(std::countr_zero(capacity))};
+    data_ = (offset & OFFSET_MASK) | (cap_log2 & TAG_MASK);
+  }
+
+  [[nodiscard]] inline uint64_t get_offset() const noexcept {
+    return data_ & OFFSET_MASK;
+  }
+
+  [[nodiscard]] inline uint64_t get_capacity() const noexcept {
+    const uint64_t cap_log2{data_ & TAG_MASK};
+    return 1ULL << cap_log2;
+  }
+};
 
 // Structure and algorithms inspired by David Chase and Yossi Lev, 2005.
 struct alignas(CACHE_LINE_SIZE) Buffer {
   alignas(CACHE_LINE_SIZE) std::atomic<int64_t> top_{0};
   alignas(CACHE_LINE_SIZE) std::atomic<int64_t> bottom_{0};
-
-  // TODO: Is there a race condition in the separate atomic reads of the buffer
-  // capacity and offset? I could fix this with an atomic struct wrapper, but
-  // make sure that it is always lock free.
-  // As of right now we are silently truncating for memory greater than 4 GB.
-  alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> buffer_capacity_{0};
-  alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> buffer_offset_{0};
+  alignas(CACHE_LINE_SIZE) std::atomic<PackedRingDescriptor> descriptor_{};
 };
 
 // Memory allocation constants
@@ -60,24 +122,18 @@ struct Registry {
   std::atomic<uint64_t> unallocated_memory_top_{
       round_up_pow2(sizeof(Registry))}; // Bump allocator
 
-  // TODO: the range of uint32_t limits the size of the memory segment we can
-  // allocate. Check if two uint64_t's is atomic or do something like a double
-  // CAS, and fall back to the uint32_t offset if not possible.
-  struct alignas(8) TaggedOffset {
-    uint32_t offset_;
-    uint32_t aba_tag_;
-  };
-  static_assert(std::atomic<TaggedOffset>::is_always_lock_free,
-                "TaggedOffset must be strictly lock-free");
-
-  struct alignas(64) PaddedFreeList {
-    std::atomic<TaggedOffset> head_{TaggedOffset{0, 0}};
+  struct alignas(CACHE_LINE_SIZE) PaddedFreeList {
+    std::atomic<uint64_t> head_{NULL_OFFSET};
   };
 
   // Segregated free list
   PaddedFreeList free_lists_[NUM_FREE_LIST_BINS];
 
-  alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> buffer_offsets_[MAX_BUFFERS];
+  struct alignas(CACHE_LINE_SIZE) PaddedOffset {
+    std::atomic<uint64_t> value_{NULL_OFFSET};
+  };
+
+  PaddedOffset buffer_offsets_[MAX_BUFFERS];
 
   std::atomic<uint32_t> initialized_flag_{0};
 
@@ -98,9 +154,7 @@ inline constexpr int SLEEP_US{1'000};
 
 class Deque {
 public:
-  // TODO: Consider how to resize the total memory block given. Right now we're
-  // assigning 3GB (which Linux allocates lazily).
-  Deque(std::string group_id, std::size_t default_size_mb = 3'000);
+  Deque(std::string group_id, std::size_t default_size_mb = 16'384);
   ~Deque() noexcept;
 
   Deque(const Deque &other) = delete;
@@ -110,30 +164,28 @@ public:
 
   // Structure and algorithms inspired by David Chase and Yossi Lev, 2005.
 
-  bool put(const char *serialized_data, std::size_t size);
+  // If the current buffer is full, try resize. Throws `bad_alloc` on failure.
+  void put(const char *serialized_data, std::size_t size);
 
   // Never resizes the buffer, returns false if capacity is reached.
-  bool try_put(const char *serialized_data, std::size_t size);
+  [[nodiscard]] bool try_put(const char *serialized_data, std::size_t size);
 
   [[nodiscard]] ObjectDescriptor get();
-  [[nodiscard]] ObjectDescriptor steal();
+  // TODO: Implement the optional params
+  [[nodiscard]] ObjectDescriptor
+      steal(/*int64_t target_victim, bool target_longest*/);
 
-  // TODO: Perhaps a targetted steal opereation that accepts a deque ID to try
-  // and steal from.
-
-  [[nodiscard]] std::size_t qsize();
-  [[nodiscard]] bool empty();
-  [[nodiscard]] bool full();
+  // Results unreliable
+  [[nodiscard]] std::size_t qsize() const;
+  [[nodiscard]] bool empty() const;
+  [[nodiscard]] bool full() const;
 
 private:
   // --- Deque state helpers ---
-
-  // Resizes the buffer up to a multiple times `current_capacity`.
   [[nodiscard]] bool grow(uint64_t current_capacity);
 
-  // TODO: Shrink buffers down at low usage (requires more sophisticated
-  // reclamation techniques without GC).
-
+  // TODO: Shrink buffers at low usage
+  //
   void cleanup();
 
   // --- Data access helpers ---
@@ -141,15 +193,13 @@ private:
                                        std::size_t size);
 
   // --- Memory management helpers ---
+  static constexpr uint64_t FREE_LIST_OFFSET_MASK = SYSTEM_OFFSET_MASK;
+  static constexpr int ABA_TAG_SHIFT = 40;
 
   // Returns the byte offset of a memory block large enough for `capacity`
   // bytes, or NULL_OFFSET (0) if out of memory or unsupported capacity.
   [[nodiscard]] uint64_t allocate(uint64_t capacity);
 
-  // IMPORTANT: For the individual items removed (not the buffers) via `get` or
-  // `steal`, `free` needs to be called safely after the memory is read. Perhaps
-  // I'll use a Python `memoryview` and only call `free` in the binding. For now
-  // we are not calling `free` in `get` or `steal`.
   void free(uint64_t offset, uint64_t capacity);
 
   // --- Pointer arithmetic helpers ---
@@ -157,8 +207,8 @@ private:
   [[nodiscard]] inline T *offset_to_ptr(uint64_t offset) noexcept {
     if (offset == 0)
       return nullptr;
-    // char * moves 1 byte
-    return reinterpret_cast<T *>(static_cast<char *>(base_address_) + offset);
+    return reinterpret_cast<T *>(static_cast<char *>(base_address_) +
+                                 offset); // char * moves one byte
   }
 
   template <typename T>
@@ -172,7 +222,7 @@ private:
   // --- Shared memory state ---
   std::string shm_name_{};
   int shm_fd_{-1};
-  std::size_t segment_size_{0}; // Bytes
+  std::size_t segment_size_{0};
   void *base_address_{nullptr};
 
   // --- Process local offsets ---
@@ -196,6 +246,10 @@ private:
   // --- Epoch based reclamation helpers ---
   void ebr_pin();
   void ebr_unpin();
+  // IMPORTANT: For the individual items removed (not the buffers) via `get` or
+  // `steal`, memory needs to be freed. We cannot directly call `free`. Perhaps
+  // I can call `ebr_retire` in the constructor of the Python object or
+  // `memoryview` (expose this functionality in the bindings).
   void ebr_retire(uint64_t offset, uint64_t size_bytes);
   bool ebr_try_advance();
   void ebr_reclaim();

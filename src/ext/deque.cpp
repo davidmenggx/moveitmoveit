@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <sys/mman.h>
@@ -21,7 +22,7 @@ Deque::Deque(std::string group_id, std::size_t default_size_mb)
   shm_fd_ = shm_open(shm_name_.c_str(), O_CREAT | O_EXCL | O_RDWR, 0666);
 
   // The first deque in the group needs to open shared memory and establish
-  // offset registry. Detect with flag O_EXCL.
+  // Registry. Detect with flag O_EXCL.
   if (shm_fd_ != -1) {
     is_creator_ = true;
     segment_size_ = default_size_mb * 1024 * 1024;
@@ -71,7 +72,7 @@ Deque::Deque(std::string group_id, std::size_t default_size_mb)
                                            std::memory_order_relaxed);
     queue_idx_ =
         registry_->next_queue_idx_.fetch_add(1, std::memory_order_relaxed);
-    registry_->initialized_flag_.store(1, std::memory_order_release);
+    registry_->initialized_flag_.store(1, std::memory_order_seq_cst);
   } else {
     Registry *temp_reg{reinterpret_cast<Registry *>(base_address_)};
     for (int i{0};
@@ -97,22 +98,22 @@ Deque::Deque(std::string group_id, std::size_t default_size_mb)
 
   const uint64_t buf_offset{registry_->unallocated_memory_top_.fetch_add(
       sizeof(Buffer), std::memory_order_relaxed)};
-  registry_->buffer_offsets_[queue_idx_] = buf_offset;
+  registry_->buffer_offsets_[queue_idx_].value_.store(
+      buf_offset, std::memory_order_relaxed);
   my_buffer_ = new (offset_to_ptr<void>(buf_offset)) Buffer();
 
   const uint64_t initial_capacity{1 << MIN_FREE_LIST_BIN_CAP};
   const uint64_t initial_buffer_offset{
-      allocate(initial_capacity * sizeof(ObjectDescriptor))};
+      allocate(initial_capacity * sizeof(RingSlot))};
 
   if (initial_buffer_offset == NULL_OFFSET) {
     cleanup();
     throw std::runtime_error(
         "CRITICAL: Initial buffer allocation failed, out of memory.");
   }
-  my_buffer_->buffer_capacity_.store(initial_capacity,
-                                     std::memory_order_relaxed);
-  my_buffer_->buffer_offset_.store(initial_buffer_offset,
-                                   std::memory_order_relaxed);
+  PackedRingDescriptor initial_descriptor{initial_buffer_offset,
+                                          initial_capacity};
+  my_buffer_->descriptor_.store(initial_descriptor, std::memory_order_relaxed);
 
   registry_->num_active_processes_.fetch_add(1, std::memory_order_relaxed);
   registry_->live_mask_.fetch_or(1ULL << queue_idx_, std::memory_order_release);
@@ -138,66 +139,70 @@ Deque::~Deque() noexcept {
 
 [[nodiscard]] ObjectDescriptor Deque::write(const char *serialized_data,
                                             std::size_t size) {
+  if (size == 0 || size > std::numeric_limits<uint32_t>::max()) [[unlikely]]
+    return ABORT;
+
   const uint64_t payload_offset{allocate(size)};
 
   if (payload_offset == NULL_OFFSET) [[unlikely]]
     return ABORT;
 
-  char *dest_ptr{offset_to_ptr<char>(payload_offset)};
-  std::memcpy(dest_ptr, serialized_data, size);
+  std::memcpy(offset_to_ptr<char>(payload_offset), serialized_data, size);
 
   return ObjectDescriptor{.offset_ = payload_offset,
                           .size_ = static_cast<uint32_t>(size),
-                          .padding_ = 0,
                           .status_ = ObjectStatus::Ok};
 }
 
-bool Deque::put(const char *serialized_data, std::size_t size) {
+void Deque::put(const char *serialized_data, std::size_t size) {
   const int64_t bottom{my_buffer_->bottom_.load(std::memory_order_relaxed)};
   const int64_t top{my_buffer_->top_.load(std::memory_order_acquire)};
-  uint64_t capacity{
-      my_buffer_->buffer_capacity_.load(std::memory_order_relaxed)};
+  PackedRingDescriptor buf_desc{
+      my_buffer_->descriptor_.load(std::memory_order_relaxed)};
+  uint64_t capacity{buf_desc.get_capacity()};
 
   // Attempt to resize up if at capacity.
   if (bottom - top >= static_cast<int64_t>(capacity)) {
     if (!grow(capacity))
-      return false; // Out of memory
-    capacity = my_buffer_->buffer_capacity_.load(std::memory_order_relaxed);
+      throw std::bad_alloc();
+    buf_desc = my_buffer_->descriptor_.load(std::memory_order_relaxed);
+    capacity = buf_desc.get_capacity();
   }
 
-  ObjectDescriptor descriptor = write(serialized_data, size);
-  if (descriptor.status_ == ObjectStatus::Abort)
-    return false;
+  ObjectDescriptor obj_desc{write(serialized_data, size)};
+  if (obj_desc.status_ == ObjectStatus::Abort)
+    throw std::bad_alloc();
 
-  const uint64_t ring_buffer_offset{
-      my_buffer_->buffer_offset_.load(std::memory_order_relaxed)};
-  auto *ring_buffer = offset_to_ptr<ObjectDescriptor>(ring_buffer_offset);
+  const uint64_t ring_buffer_offset{buf_desc.get_offset()};
+  auto *ring_buffer = offset_to_ptr<RingSlot>(ring_buffer_offset);
 
-  ring_buffer[bottom & (capacity - 1)] = descriptor;
+  ring_buffer[bottom & (capacity - 1)].store(obj_desc,
+                                             std::memory_order_relaxed);
 
   my_buffer_->bottom_.store(bottom + 1, std::memory_order_release);
-  return true;
 }
 
-bool Deque::try_put(const char *serialized_data, std::size_t size) {
+[[nodiscard]] bool Deque::try_put(const char *serialized_data,
+                                  std::size_t size) {
   const int64_t bottom{my_buffer_->bottom_.load(std::memory_order_relaxed)};
   const int64_t top{my_buffer_->top_.load(std::memory_order_acquire)};
-  const uint64_t capacity{
-      my_buffer_->buffer_capacity_.load(std::memory_order_relaxed)};
+  PackedRingDescriptor buf_desc{
+      my_buffer_->descriptor_.load(std::memory_order_relaxed)};
+  const uint64_t capacity{buf_desc.get_capacity()};
 
   // Do not resize up if at capacity, return false.
   if (bottom - top >= static_cast<int64_t>(capacity))
     return false;
 
-  ObjectDescriptor descriptor = write(serialized_data, size);
-  if (descriptor.status_ == ObjectStatus::Abort)
+  ObjectDescriptor obj_desc{write(serialized_data, size)};
+  if (obj_desc.status_ == ObjectStatus::Abort)
     return false;
 
-  const uint64_t ring_buffer_offset{
-      my_buffer_->buffer_offset_.load(std::memory_order_relaxed)};
-  auto *ring_buffer = offset_to_ptr<ObjectDescriptor>(ring_buffer_offset);
+  const uint64_t ring_buffer_offset{buf_desc.get_offset()};
+  auto *ring_buffer = offset_to_ptr<RingSlot>(ring_buffer_offset);
 
-  ring_buffer[bottom & (capacity - 1)] = descriptor;
+  ring_buffer[bottom & (capacity - 1)].store(obj_desc,
+                                             std::memory_order_relaxed);
 
   my_buffer_->bottom_.store(bottom + 1, std::memory_order_release);
   return true;
@@ -212,18 +217,22 @@ bool Deque::try_put(const char *serialized_data, std::size_t size) {
 
   int64_t top{my_buffer_->top_.load(std::memory_order_relaxed)};
 
-  if (ebr_cycles_since_advance_++ >= EBR_CYCLE_FORCE_ADVANCE)
-    ebr_try_advance();
-
   if (top <= bottom) {
+    PackedRingDescriptor desc{
+        my_buffer_->descriptor_.load(std::memory_order_relaxed)};
     // Deque is nonempty
-    const uint64_t capacity{
-        my_buffer_->buffer_capacity_.load(std::memory_order_relaxed)};
-    const uint64_t ring_buffer_offset{
-        my_buffer_->buffer_offset_.load(std::memory_order_relaxed)};
-    auto *ring_buffer = offset_to_ptr<ObjectDescriptor>(ring_buffer_offset);
+    if (ebr_cycles_since_advance_++ >= EBR_CYCLE_FORCE_ADVANCE) {
+      if (ebr_try_advance())
+        ebr_reclaim();
+      ebr_cycles_since_advance_ = 0;
+    }
 
-    ObjectDescriptor item{ring_buffer[bottom & (capacity - 1)]};
+    const uint64_t capacity{desc.get_capacity()};
+    const uint64_t ring_buffer_offset{desc.get_offset()};
+    auto *ring_buffer = offset_to_ptr<RingSlot>(ring_buffer_offset);
+
+    ObjectDescriptor item{
+        ring_buffer[bottom & (capacity - 1)].load(std::memory_order_relaxed)};
 
     if (top != bottom)
       return item;
@@ -242,6 +251,7 @@ bool Deque::try_put(const char *serialized_data, std::size_t size) {
   }
 }
 
+// TODO: Perhaps modify steal to choose the queue with the most items.
 [[nodiscard]] ObjectDescriptor Deque::steal() {
   uint64_t candidates = registry_->live_mask_.load(std::memory_order_acquire) &
                         ~(1ULL << queue_idx_);
@@ -255,35 +265,68 @@ bool Deque::try_put(const char *serialized_data, std::size_t size) {
     temp &= temp - 1;
   const int victim_idx{std::countr_zero(temp)};
 
-  const uint64_t victim_buf_offset{registry_->buffer_offsets_[victim_idx]};
+  const uint64_t victim_buf_offset{
+      registry_->buffer_offsets_[victim_idx].value_.load(
+          std::memory_order_relaxed)};
   auto *victim_buffer = offset_to_ptr<Buffer>(victim_buf_offset);
 
+  // Unpinned pre-check: Buffer is never retired so top_/bottom_ are always
+  // safe to load without a pin. This avoids pinning for clearly empty victims.
+  {
+    int64_t top{victim_buffer->top_.load(std::memory_order_acquire)};
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    int64_t bottom{victim_buffer->bottom_.load(std::memory_order_acquire)};
+    if (top >= bottom)
+      return EMPTY;
+  }
+
+  ebr_pin();
+
+  // Re-read under the pin. The pre-check window is unprotected, so top or
+  // bottom may have changed (a concurrent steal could have drained the queue).
   int64_t top{victim_buffer->top_.load(std::memory_order_acquire)};
   std::atomic_thread_fence(std::memory_order_seq_cst);
   int64_t bottom{victim_buffer->bottom_.load(std::memory_order_acquire)};
 
-  if (top >= bottom)
+  if (top >= bottom) {
+    ebr_unpin();
     return EMPTY;
+  }
 
-  ebr_pin();
+  const PackedRingDescriptor desc{
+      victim_buffer->descriptor_.load(std::memory_order_acquire)};
+  const uint64_t capacity{desc.get_capacity()};
+  const uint64_t ring_buffer_offset{desc.get_offset()};
+  auto *ring_buffer = offset_to_ptr<RingSlot>(ring_buffer_offset);
 
-  const uint64_t capacity{
-      victim_buffer->buffer_capacity_.load(std::memory_order_acquire)};
-  const uint64_t ring_buffer_offset{
-      victim_buffer->buffer_offset_.load(std::memory_order_acquire)};
-  auto *ring_buffer = offset_to_ptr<ObjectDescriptor>(ring_buffer_offset);
-
-  ObjectDescriptor item{ring_buffer[top & (capacity - 1)]};
+  ObjectDescriptor item{
+      ring_buffer[top & (capacity - 1)].load(std::memory_order_relaxed)};
 
   const bool cas_ok{victim_buffer->top_.compare_exchange_strong(
       top, top + 1, std::memory_order_seq_cst, std::memory_order_relaxed)};
 
   ebr_unpin();
 
-  // TODO: Check if this is causing too much contention.
+  // TODO: Measure if this is causing too much contention.
   ebr_try_advance();
 
   return cas_ok ? item : ABORT;
+}
+
+[[nodiscard]] std::size_t Deque::qsize() const {
+  const int64_t top{my_buffer_->top_.load(std::memory_order_acquire)};
+  const int64_t bottom{my_buffer_->bottom_.load(std::memory_order_relaxed)};
+  const int64_t current_size{bottom - top};
+  return current_size < 0 ? 0 : static_cast<std::size_t>(current_size);
+}
+
+[[nodiscard]] bool Deque::empty() const { return qsize() == 0; }
+
+[[nodiscard]] bool Deque::full() const {
+  PackedRingDescriptor desc{
+      my_buffer_->descriptor_.load(std::memory_order_relaxed)};
+  const uint64_t capacity{desc.get_capacity()};
+  return qsize() >= capacity;
 }
 
 // TODO: Consier memory fragmentation issues
@@ -293,19 +336,27 @@ bool Deque::try_put(const char *serialized_data, std::size_t size) {
   if (bin_idx < 0) [[unlikely]]
     return NULL_OFFSET;
 
-  Registry::TaggedOffset head{
+  uint64_t head{
       registry_->free_lists_[bin_idx].head_.load(std::memory_order_acquire)};
 
-  // CAS loop to find the next free chunk in the appropriate bin.
-  while (head.offset_ != NULL_OFFSET) {
-    const uint32_t next_offset{
-        offset_to_ptr<std::atomic<uint32_t>>(head.offset_)
-            ->load(std::memory_order_relaxed)};
-    const Registry::TaggedOffset new_head{next_offset, head.aba_tag_ + 1};
+  while (true) {
+    const uint64_t offset{head & FREE_LIST_OFFSET_MASK};
+    if (offset == NULL_OFFSET)
+      break; // Fallback to bump allocator
+
+    const uint64_t next_offset{
+        offset_to_ptr<std::atomic<uint64_t>>(offset)->load(
+            std::memory_order_relaxed) &
+        FREE_LIST_OFFSET_MASK};
+
+    const uint64_t current_tag_bits{head & ~FREE_LIST_OFFSET_MASK};
+    const uint64_t new_head{current_tag_bits | next_offset};
+
     if (registry_->free_lists_[bin_idx].head_.compare_exchange_weak(
             head, new_head, std::memory_order_acquire,
-            std::memory_order_acquire))
-      return head.offset_;
+            std::memory_order_acquire)) {
+      return offset;
+    }
   }
 
   // Fallback to bump allocation. Allocate the entire bin (not just capacity) so
@@ -339,51 +390,55 @@ void Deque::free(uint64_t offset, uint64_t capacity) {
 
   const int bin_idx{
       calculate_bin(capacity, MIN_FREE_LIST_BIN_CAP, NUM_FREE_LIST_BINS)};
-
-  // We try to free an amount of memory greater than the supported bins.
   if (bin_idx < 0) [[unlikely]]
     return;
 
-  auto *next_ptr = offset_to_ptr<std::atomic<uint32_t>>(offset);
+  auto *next_ptr = offset_to_ptr<std::atomic<uint64_t>>(offset);
 
-  Registry::TaggedOffset head{
+  uint64_t head{
       registry_->free_lists_[bin_idx].head_.load(std::memory_order_relaxed)};
 
   while (true) {
-    next_ptr->store(head.offset_, std::memory_order_relaxed);
+    next_ptr->store(head & FREE_LIST_OFFSET_MASK, std::memory_order_relaxed);
 
-    Registry::TaggedOffset new_head{static_cast<uint32_t>(offset),
-                                    head.aba_tag_ + 1};
+    // Extract tag, increment it, and combine it with the newly freed offset.
+    const uint64_t next_tag{((head >> ABA_TAG_SHIFT) + 1) << ABA_TAG_SHIFT};
+    const uint64_t new_head{next_tag | (offset & FREE_LIST_OFFSET_MASK)};
 
     if (registry_->free_lists_[bin_idx].head_.compare_exchange_weak(
             head, new_head, std::memory_order_release,
             std::memory_order_relaxed))
-      break; // Successfully added to the free list
+      break;
   }
 }
 
 [[nodiscard]] bool Deque::grow(uint64_t current_capacity) {
-  const uint64_t old_offset{
-      my_buffer_->buffer_offset_.load(std::memory_order_relaxed)};
-  const uint64_t old_size{current_capacity * sizeof(ObjectDescriptor)};
+  const PackedRingDescriptor desc{
+      my_buffer_->descriptor_.load(std::memory_order_relaxed)};
+  const uint64_t old_offset{desc.get_offset()};
+  const uint64_t old_size{current_capacity * sizeof(RingSlot)};
 
   const uint64_t new_capacity{current_capacity * 2};
-  const uint64_t new_offset{allocate(new_capacity * sizeof(ObjectDescriptor))};
+  const uint64_t new_offset{allocate(new_capacity * sizeof(RingSlot))};
 
   if (new_offset == NULL_OFFSET) [[unlikely]]
     return false;
 
-  auto *old_ring = offset_to_ptr<ObjectDescriptor>(old_offset);
-  auto *new_ring = offset_to_ptr<ObjectDescriptor>(new_offset);
+  auto *old_ring = offset_to_ptr<RingSlot>(old_offset);
+  auto *new_ring = offset_to_ptr<RingSlot>(new_offset);
 
   const int64_t bottom{my_buffer_->bottom_.load(std::memory_order_relaxed)};
   const int64_t top{my_buffer_->top_.load(std::memory_order_acquire)};
 
-  for (int64_t i{top}; i < bottom; ++i)
-    new_ring[i & (new_capacity - 1)] = old_ring[i & (current_capacity - 1)];
+  for (int64_t i{top}; i < bottom; ++i) {
+    const ObjectDescriptor item{
+        old_ring[i & (current_capacity - 1)].load(std::memory_order_relaxed)};
 
-  my_buffer_->buffer_offset_.store(new_offset, std::memory_order_release);
-  my_buffer_->buffer_capacity_.store(new_capacity, std::memory_order_release);
+    new_ring[i & (new_capacity - 1)].store(item, std::memory_order_relaxed);
+  }
+
+  PackedRingDescriptor new_desc(new_offset, new_capacity);
+  my_buffer_->descriptor_.store(new_desc, std::memory_order_release);
 
   ebr_retire(old_offset, old_size);
   ebr_try_advance();
@@ -394,6 +449,8 @@ void Deque::free(uint64_t offset, uint64_t capacity) {
 
 void Deque::cleanup() {
   if (registry_ != nullptr && queue_idx_ != -1) {
+    registry_->live_mask_.fetch_and(~(1ULL << queue_idx_),
+                                    std::memory_order_release);
     registry_->num_active_processes_.fetch_sub(1, std::memory_order_relaxed);
     queue_idx_ = -1;
   }
@@ -456,7 +513,7 @@ bool Deque::ebr_try_advance() {
 
 void Deque::ebr_reclaim() {
   const uint64_t global{
-      registry_->global_epoch_.load(std::memory_order_relaxed)};
+      registry_->global_epoch_.load(std::memory_order_acquire)};
   if (global < 2)
     return; // Not enough epochs have elapsed yet.
 
