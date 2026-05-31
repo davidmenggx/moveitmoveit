@@ -70,8 +70,8 @@ Deque::Deque(std::string group_id, std::size_t default_size_mb)
     registry_ = new (base_address_) Registry();
     registry_->global_segement_size_.store(segment_size_,
                                            std::memory_order_relaxed);
-    queue_idx_ =
-        registry_->next_queue_idx_.fetch_add(1, std::memory_order_relaxed);
+    queue_idx_ = 0;
+    registry_->live_mask_.store(1ULL << queue_idx_, std::memory_order_release);
     registry_->initialized_flag_.store(1, std::memory_order_seq_cst);
   } else {
     Registry *temp_reg{reinterpret_cast<Registry *>(base_address_)};
@@ -86,20 +86,32 @@ Deque::Deque(std::string group_id, std::size_t default_size_mb)
       std::this_thread::sleep_for(std::chrono::microseconds(100));
     }
     registry_ = temp_reg;
-    queue_idx_ =
-        registry_->next_queue_idx_.fetch_add(1, std::memory_order_relaxed);
-  }
 
-  if (queue_idx_ >= MAX_BUFFERS) {
-    cleanup();
-    throw std::runtime_error("CRITICAL: Deque group is full (" +
-                             std::to_string(MAX_BUFFERS) + " max).");
+    // Loop to try and find an index to claim.
+    uint64_t current_mask{
+        registry_->live_mask_.load(std::memory_order_acquire)};
+    while (true) {
+      int free_idx{std::countr_zero(~current_mask)};
+      if (free_idx >= MAX_BUFFERS) {
+        cleanup();
+        throw std::runtime_error("CRITICAL: Deque group is full (" +
+                                 std::to_string(MAX_BUFFERS) + " max).");
+      }
+
+      uint64_t new_mask{current_mask | (1ULL << free_idx)};
+      if (registry_->live_mask_.compare_exchange_weak(
+              current_mask, new_mask, std::memory_order_acq_rel,
+              std::memory_order_acquire)) {
+        queue_idx_ = free_idx;
+        break;
+      }
+    }
   }
 
   const uint64_t buf_offset{registry_->unallocated_memory_top_.fetch_add(
       sizeof(Buffer), std::memory_order_relaxed)};
   registry_->buffer_offsets_[queue_idx_].value_.store(
-      buf_offset, std::memory_order_relaxed);
+      buf_offset, std::memory_order_release);
   my_buffer_ = new (offset_to_ptr<void>(buf_offset)) Buffer();
 
   const uint64_t initial_capacity{1 << MIN_FREE_LIST_BIN_CAP};
@@ -116,25 +128,15 @@ Deque::Deque(std::string group_id, std::size_t default_size_mb)
   my_buffer_->descriptor_.store(initial_descriptor, std::memory_order_relaxed);
 
   registry_->num_active_processes_.fetch_add(1, std::memory_order_relaxed);
-  registry_->live_mask_.fetch_or(1ULL << queue_idx_, std::memory_order_release);
+  process_count_incremented_ = true;
 
   rng_.seed(getpid());
 }
 
 Deque::~Deque() noexcept {
+  // TODO: Consider having the destructor just call cleanup.
   ebr_unpin();
-  registry_->live_mask_.fetch_and(~(1ULL << queue_idx_),
-                                  std::memory_order_release);
-
-  const int64_t remaining{
-      registry_->num_active_processes_.fetch_sub(1, std::memory_order_acq_rel) -
-      1};
-
-  munmap(base_address_, segment_size_);
-  close(shm_fd_);
-
-  if (remaining == 0)
-    shm_unlink(shm_name_.c_str());
+  cleanup();
 }
 
 [[nodiscard]] ObjectDescriptor Deque::write(const char *serialized_data,
@@ -142,16 +144,36 @@ Deque::~Deque() noexcept {
   if (size == 0 || size > std::numeric_limits<uint32_t>::max()) [[unlikely]]
     return ABORT;
 
-  const uint64_t payload_offset{allocate(size)};
+  // Allocate enough for the header and payload.
+  const uint64_t alloc_size{sizeof(uint32_t) + size};
+  const uint64_t alloc_offset{allocate(alloc_size)};
 
-  if (payload_offset == NULL_OFFSET) [[unlikely]]
+  if (alloc_offset == NULL_OFFSET) [[unlikely]]
     return ABORT;
 
-  std::memcpy(offset_to_ptr<char>(payload_offset), serialized_data, size);
+  char *base{offset_to_ptr<char>(alloc_offset)};
 
-  return ObjectDescriptor{.offset_ = payload_offset,
-                          .size_ = static_cast<uint32_t>(size),
+  const uint32_t payload_size{static_cast<uint32_t>(size)};
+  std::memcpy(base, &payload_size, sizeof(uint32_t));
+
+  std::memcpy(base + sizeof(uint32_t), serialized_data, size);
+
+  return ObjectDescriptor{.offset_ = alloc_offset,
+                          .size_ = payload_size,
                           .status_ = ObjectStatus::Ok};
+}
+
+void Deque::recover_size(ObjectDescriptor &desc) const noexcept {
+  if (desc.status_ != ObjectStatus::Ok || desc.offset_ == 0)
+    return;
+  uint32_t sz = 0;
+  std::memcpy(&sz, offset_to_ptr<const char>(desc.offset_), sizeof(uint32_t));
+  desc.size_ = sz;
+}
+
+[[nodiscard]] inline const char *
+Deque::payload_ptr(const ObjectDescriptor &d) const noexcept {
+  return offset_to_ptr<const char>(d.offset_) + sizeof(uint32_t);
 }
 
 void Deque::put(const char *serialized_data, std::size_t size) {
@@ -215,24 +237,25 @@ void Deque::put(const char *serialized_data, std::size_t size) {
 
   std::atomic_thread_fence(std::memory_order_seq_cst);
 
-  int64_t top{my_buffer_->top_.load(std::memory_order_relaxed)};
+  int64_t top{my_buffer_->top_.load(std::memory_order_seq_cst)};
+
+  if (ebr_cycles_since_advance_++ >= EBR_CYCLE_FORCE_ADVANCE) {
+    if (ebr_try_advance())
+      ebr_reclaim();
+    ebr_cycles_since_advance_ = 0;
+  }
 
   if (top <= bottom) {
     PackedRingDescriptor desc{
         my_buffer_->descriptor_.load(std::memory_order_relaxed)};
     // Deque is nonempty
-    if (ebr_cycles_since_advance_++ >= EBR_CYCLE_FORCE_ADVANCE) {
-      if (ebr_try_advance())
-        ebr_reclaim();
-      ebr_cycles_since_advance_ = 0;
-    }
-
     const uint64_t capacity{desc.get_capacity()};
     const uint64_t ring_buffer_offset{desc.get_offset()};
     auto *ring_buffer = offset_to_ptr<RingSlot>(ring_buffer_offset);
 
     ObjectDescriptor item{
         ring_buffer[bottom & (capacity - 1)].load(std::memory_order_relaxed)};
+    recover_size(item);
 
     if (top != bottom)
       return item;
@@ -267,7 +290,11 @@ void Deque::put(const char *serialized_data, std::size_t size) {
 
   const uint64_t victim_buf_offset{
       registry_->buffer_offsets_[victim_idx].value_.load(
-          std::memory_order_relaxed)};
+          std::memory_order_acquire)};
+
+  if (victim_buf_offset == NULL_OFFSET)
+    return EMPTY;
+
   auto *victim_buffer = offset_to_ptr<Buffer>(victim_buf_offset);
 
   // Unpinned pre-check: Buffer is never retired so top_/bottom_ are always
@@ -308,9 +335,14 @@ void Deque::put(const char *serialized_data, std::size_t size) {
   ebr_unpin();
 
   // TODO: Measure if this is causing too much contention.
-  ebr_try_advance();
+  if (ebr_try_advance())
+    ebr_reclaim();
 
-  return cas_ok ? item : ABORT;
+  if (!cas_ok)
+    return ABORT;
+
+  recover_size(item);
+  return item;
 }
 
 [[nodiscard]] std::size_t Deque::qsize() const {
@@ -447,11 +479,14 @@ void Deque::free(uint64_t offset, uint64_t capacity) {
   return true;
 }
 
-void Deque::cleanup() {
+void Deque::cleanup() noexcept {
   if (registry_ != nullptr && queue_idx_ != -1) {
     registry_->live_mask_.fetch_and(~(1ULL << queue_idx_),
                                     std::memory_order_release);
-    registry_->num_active_processes_.fetch_sub(1, std::memory_order_relaxed);
+    if (process_count_incremented_) {
+      registry_->num_active_processes_.fetch_sub(1, std::memory_order_acq_rel);
+      process_count_incremented_ = false;
+    }
     queue_idx_ = -1;
   }
 
@@ -471,7 +506,7 @@ void Deque::cleanup() {
   }
 }
 
-void Deque::ebr_pin() {
+void Deque::ebr_pin() noexcept {
   uint64_t epoch{};
   do {
     epoch = registry_->global_epoch_.load(std::memory_order_acquire);
@@ -480,18 +515,18 @@ void Deque::ebr_pin() {
   } while (registry_->global_epoch_.load(std::memory_order_acquire) != epoch);
 }
 
-void Deque::ebr_unpin() {
+void Deque::ebr_unpin() noexcept {
   registry_->pinned_epochs_[queue_idx_].value_.store(Registry::EBR_UNPINNED,
                                                      std::memory_order_release);
 }
 
-void Deque::ebr_retire(uint64_t offset, uint64_t size_bytes) {
+void Deque::ebr_retire(uint64_t offset, uint64_t size_bytes) noexcept {
   const uint64_t epoch{
-      registry_->global_epoch_.load(std::memory_order_relaxed)};
+      registry_->global_epoch_.load(std::memory_order_acquire)};
   retire_lists_[epoch % EBR_EPOCHS].push_back({offset, size_bytes});
 }
 
-bool Deque::ebr_try_advance() {
+bool Deque::ebr_try_advance() noexcept {
   uint64_t global{registry_->global_epoch_.load(std::memory_order_acquire)};
   uint64_t mask{registry_->live_mask_.load(std::memory_order_acquire)};
 
@@ -511,7 +546,7 @@ bool Deque::ebr_try_advance() {
       global, global + 1, std::memory_order_acq_rel, std::memory_order_relaxed);
 }
 
-void Deque::ebr_reclaim() {
+void Deque::ebr_reclaim() noexcept {
   const uint64_t global{
       registry_->global_epoch_.load(std::memory_order_acquire)};
   if (global < 2)

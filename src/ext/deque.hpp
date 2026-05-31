@@ -1,7 +1,6 @@
 #pragma once
 
 #include "utils/rng.hpp"
-#include "utils/round_up_pow2.hpp"
 
 #include <array>
 #include <atomic>
@@ -44,19 +43,17 @@ struct alignas(8) RingSlot {
 
   void store(const ObjectDescriptor &d, std::memory_order mo) noexcept {
     const uint64_t safe_offset{d.offset_ & SYSTEM_OFFSET_MASK};
-    const uint64_t safe_size{static_cast<uint64_t>(d.size_) & 0x3FFFFFULL};
     const uint64_t safe_status{static_cast<uint64_t>(d.status_) & 0x3ULL};
 
-    const uint64_t packed{(safe_offset << 24) | (safe_size << 2) | safe_status};
-    data_.store(packed, mo);
+    data_.store((safe_offset << 2) | safe_status, mo);
   }
 
   [[nodiscard]] ObjectDescriptor load(std::memory_order mo) const noexcept {
     const uint64_t packed{data_.load(mo)};
 
-    return ObjectDescriptor{.offset_ = packed >> 24,
+    return ObjectDescriptor{.offset_ = (packed >> 2) & SYSTEM_OFFSET_MASK,
                             .size_ =
-                                static_cast<uint32_t>((packed >> 2) & 0x3FFFFF),
+                                0, // Note: populate later with recover_size()
                             .status_ = static_cast<ObjectStatus>(packed & 0x3)};
   }
 };
@@ -64,12 +61,8 @@ struct alignas(8) RingSlot {
 static_assert(sizeof(RingSlot) == 8);
 
 // Deque state constants
+// Note: We only support 64 concurrent processes.
 inline constexpr int64_t MAX_BUFFERS = 64;
-
-// NOTE: We currently only support 64 total queue lifetimes (NOT concurrent
-// connections), perhaps re-use the queue indices in the Registry. IMPORTANT
-// TODO: Make sure MAX_BUFFERS is actually a concurrent connection count, not a
-// lifetime count.
 
 inline constexpr ObjectDescriptor EMPTY{0, 0, ObjectStatus::Empty};
 inline constexpr ObjectDescriptor ABORT{0, 0, ObjectStatus::Abort};
@@ -100,6 +93,9 @@ struct PackedRingDescriptor {
   }
 };
 
+static_assert(std::atomic<PackedRingDescriptor>::is_always_lock_free,
+              "CRITICAL: atomic<PackedRingDescriptor> must be lock-free");
+
 // Structure and algorithms inspired by David Chase and Yossi Lev, 2005.
 struct alignas(CACHE_LINE_SIZE) Buffer {
   alignas(CACHE_LINE_SIZE) std::atomic<int64_t> top_{0};
@@ -115,12 +111,12 @@ inline constexpr int NUM_FREE_LIST_BINS{25};
 // Metadata on the shared memory state.
 struct Registry {
   std::atomic<int64_t> num_active_processes_{0};
-  std::atomic<int64_t> next_queue_idx_{0};
   std::atomic<uint64_t> live_mask_{0};
   std::atomic<uint64_t> global_segement_size_{0};
 
   std::atomic<uint64_t> unallocated_memory_top_{
-      round_up_pow2(sizeof(Registry))}; // Bump allocator
+      (sizeof(Registry) + CACHE_LINE_SIZE - 1) &
+      ~(CACHE_LINE_SIZE - 1)}; // Bump allocator
 
   struct alignas(CACHE_LINE_SIZE) PaddedFreeList {
     std::atomic<uint64_t> head_{NULL_OFFSET};
@@ -186,11 +182,17 @@ private:
 
   // TODO: Shrink buffers at low usage
   //
-  void cleanup();
+  void cleanup() noexcept;
 
   // --- Data access helpers ---
   [[nodiscard]] ObjectDescriptor write(const char *serialized_data,
                                        std::size_t size);
+  // We are embedding the size attribute of the ObjectDescriptor (inside each
+  // RingSlot) into the beginning of the allocated block where the objected is
+  // stored.
+  void recover_size(ObjectDescriptor &desc) const noexcept;
+  [[nodiscard]] const char *
+  payload_ptr(const ObjectDescriptor &d) const noexcept;
 
   // --- Memory management helpers ---
   static constexpr uint64_t FREE_LIST_OFFSET_MASK = SYSTEM_OFFSET_MASK;
@@ -204,7 +206,7 @@ private:
 
   // --- Pointer arithmetic helpers ---
   template <typename T>
-  [[nodiscard]] inline T *offset_to_ptr(uint64_t offset) noexcept {
+  [[nodiscard]] inline T *offset_to_ptr(uint64_t offset) const noexcept {
     if (offset == 0)
       return nullptr;
     return reinterpret_cast<T *>(static_cast<char *>(base_address_) +
@@ -212,7 +214,7 @@ private:
   }
 
   template <typename T>
-  [[nodiscard]] inline uint64_t ptr_to_offset(T *ptr) noexcept {
+  [[nodiscard]] inline uint64_t ptr_to_offset(T *ptr) const noexcept {
     if (!ptr)
       return 0;
     return static_cast<uint64_t>(reinterpret_cast<char *>(ptr) -
@@ -230,6 +232,7 @@ private:
   Buffer *my_buffer_{nullptr};
   int64_t queue_idx_{-1};
   bool is_creator_{false};
+  bool process_count_incremented_{false};
 
   FastRNG rng_{};
 
@@ -239,19 +242,29 @@ private:
     uint64_t offset_;
     uint64_t size_bytes_;
   };
+  // TODO: There is a memory leak here when a process drops out, as its vector
+  // and array are cleared but the underlying buffer is lost. We should replace
+  // this heap-local array<vector> to shared memory.
   std::array<std::vector<RetiredBuffer>, EBR_EPOCHS> retire_lists_{};
   static constexpr int EBR_CYCLE_FORCE_ADVANCE = 128;
   int ebr_cycles_since_advance_{0};
 
   // --- Epoch based reclamation helpers ---
-  void ebr_pin();
-  void ebr_unpin();
-  // IMPORTANT: For the individual items removed (not the buffers) via `get` or
-  // `steal`, memory needs to be freed. We cannot directly call `free`. Perhaps
-  // I can call `ebr_retire` in the constructor of the Python object or
+
+  // Call prior to entering the critical section.
+  void ebr_pin() noexcept;
+
+  // Call upon leaving the critical section so the application can progress.
+  void ebr_unpin() noexcept;
+
+  // CRITICAL IMPORTANT: For the individual items removed (not the buffers) via
+  // `get` or `steal`, memory needs to be freed. We cannot directly call `free`.
+  // Perhaps I can call `ebr_retire` in the constructor of the Python object or
   // `memoryview` (expose this functionality in the bindings).
-  void ebr_retire(uint64_t offset, uint64_t size_bytes);
-  bool ebr_try_advance();
-  void ebr_reclaim();
+  void ebr_retire(uint64_t offset, uint64_t size_bytes) noexcept;
+
+  // Returns `false` and fails if a process is in an older epoch.
+  bool ebr_try_advance() noexcept;
+  void ebr_reclaim() noexcept;
 };
 } // namespace moveitmoveit
