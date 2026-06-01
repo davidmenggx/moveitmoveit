@@ -16,6 +16,8 @@ dependencies = []
 [tool.scikit-build]
 cmake.version = ">=3.18"
 ninja.version = ">=1.10"
+editable.rebuild = true
+build-dir = "build/{wheel_tag}"
 
 [tool.scikit-build.cmake.define]
 BUILD_TESTING = "OFF"
