@@ -7,8 +7,10 @@ nanobind_add_module(moveitmoveit_ext
   deque.cpp
 )
 
+target_include_directories(moveitmoveit_ext SYSTEM PRIVATE ${nanobind_INCLUDE_DIR} ${Python_INCLUDE_DIRS})
+
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    add_compile_options(-Wall -Wextra -Wpedantic -Werror)
+  target_compile_options(moveitmoveit_ext PRIVATE -std=c++20 -Wall -Wextra -Wpedantic -Werror -march=native)
 endif()
 
 install(TARGETS moveitmoveit_ext DESTINATION moveitmoveit)

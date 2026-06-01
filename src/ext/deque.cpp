@@ -110,21 +110,21 @@ Deque::Deque(std::string group_id, std::size_t default_size_mb)
 
   const uint64_t buf_offset{registry_->unallocated_memory_top_.fetch_add(
       sizeof(Buffer), std::memory_order_relaxed)};
+  my_buffer_ = new (offset_to_ptr<void>(buf_offset)) Buffer();
   registry_->buffer_offsets_[queue_idx_].value_.store(
       buf_offset, std::memory_order_release);
-  my_buffer_ = new (offset_to_ptr<void>(buf_offset)) Buffer();
 
   const uint64_t initial_capacity{1 << MIN_FREE_LIST_BIN_CAP};
   const uint64_t initial_buffer_offset{
-      allocate(initial_capacity * sizeof(RingSlot))};
+      allocate(initial_capacity * sizeof(std::atomic<ObjectDescriptor>))};
 
   if (initial_buffer_offset == NULL_OFFSET) {
     cleanup();
     throw std::runtime_error(
         "CRITICAL: Initial buffer allocation failed, out of memory.");
   }
-  PackedRingDescriptor initial_descriptor{initial_buffer_offset,
-                                          initial_capacity};
+  RingDescriptor initial_descriptor{.offset_ = initial_buffer_offset,
+                                    .capacity_ = initial_capacity};
   my_buffer_->descriptor_.store(initial_descriptor, std::memory_order_relaxed);
 
   registry_->num_active_processes_.fetch_add(1, std::memory_order_relaxed);
@@ -134,7 +134,6 @@ Deque::Deque(std::string group_id, std::size_t default_size_mb)
 }
 
 Deque::~Deque() noexcept {
-  // TODO: Consider having the destructor just call cleanup.
   ebr_unpin();
   cleanup();
 }
@@ -144,73 +143,64 @@ Deque::~Deque() noexcept {
   if (size == 0 || size > std::numeric_limits<uint32_t>::max()) [[unlikely]]
     return ABORT;
 
-  // Allocate enough for the header and payload.
-  const uint64_t alloc_size{sizeof(uint32_t) + size};
-  const uint64_t alloc_offset{allocate(alloc_size)};
-
+  const uint64_t alloc_offset{allocate(size)};
   if (alloc_offset == NULL_OFFSET) [[unlikely]]
     return ABORT;
 
   char *base{offset_to_ptr<char>(alloc_offset)};
-
-  const uint32_t payload_size{static_cast<uint32_t>(size)};
-  std::memcpy(base, &payload_size, sizeof(uint32_t));
-
-  std::memcpy(base + sizeof(uint32_t), serialized_data, size);
+  std::memcpy(base, serialized_data, size);
 
   return ObjectDescriptor{.offset_ = alloc_offset,
-                          .size_ = payload_size,
+                          .size_ = static_cast<uint32_t>(size),
                           .status_ = ObjectStatus::Ok};
-}
-
-void Deque::recover_size(ObjectDescriptor &desc) const noexcept {
-  if (desc.status_ != ObjectStatus::Ok || desc.offset_ == 0)
-    return;
-  uint32_t sz = 0;
-  std::memcpy(&sz, offset_to_ptr<const char>(desc.offset_), sizeof(uint32_t));
-  desc.size_ = sz;
 }
 
 [[nodiscard]] inline const char *
 Deque::payload_ptr(const ObjectDescriptor &d) const noexcept {
-  return offset_to_ptr<const char>(d.offset_) + sizeof(uint32_t);
+  return offset_to_ptr<const char>(d.offset_);
 }
 
 void Deque::put(const char *serialized_data, std::size_t size) {
   const int64_t bottom{my_buffer_->bottom_.load(std::memory_order_relaxed)};
   const int64_t top{my_buffer_->top_.load(std::memory_order_acquire)};
-  PackedRingDescriptor buf_desc{
+  RingDescriptor buf_desc{
       my_buffer_->descriptor_.load(std::memory_order_relaxed)};
-  uint64_t capacity{buf_desc.get_capacity()};
+  uint64_t capacity{buf_desc.capacity_};
 
   // Attempt to resize up if at capacity.
   if (bottom - top >= static_cast<int64_t>(capacity)) {
     if (!grow(capacity))
       throw std::bad_alloc();
     buf_desc = my_buffer_->descriptor_.load(std::memory_order_relaxed);
-    capacity = buf_desc.get_capacity();
+    capacity = buf_desc.capacity_;
   }
 
   ObjectDescriptor obj_desc{write(serialized_data, size)};
   if (obj_desc.status_ == ObjectStatus::Abort)
     throw std::bad_alloc();
 
-  const uint64_t ring_buffer_offset{buf_desc.get_offset()};
-  auto *ring_buffer = offset_to_ptr<RingSlot>(ring_buffer_offset);
+  auto *ring_buffer =
+      offset_to_ptr<std::atomic<ObjectDescriptor>>(buf_desc.offset_);
 
   ring_buffer[bottom & (capacity - 1)].store(obj_desc,
                                              std::memory_order_relaxed);
 
   my_buffer_->bottom_.store(bottom + 1, std::memory_order_release);
+
+  if (ebr_cycles_since_advance_++ >= EBR_CYCLE_FORCE_ADVANCE) {
+    if (ebr_try_advance())
+      ebr_reclaim();
+    ebr_cycles_since_advance_ = 0;
+  }
 }
 
 [[nodiscard]] bool Deque::try_put(const char *serialized_data,
                                   std::size_t size) {
   const int64_t bottom{my_buffer_->bottom_.load(std::memory_order_relaxed)};
   const int64_t top{my_buffer_->top_.load(std::memory_order_acquire)};
-  PackedRingDescriptor buf_desc{
+  RingDescriptor buf_desc{
       my_buffer_->descriptor_.load(std::memory_order_relaxed)};
-  const uint64_t capacity{buf_desc.get_capacity()};
+  const uint64_t capacity{buf_desc.capacity_};
 
   // Do not resize up if at capacity, return false.
   if (bottom - top >= static_cast<int64_t>(capacity))
@@ -218,22 +208,29 @@ void Deque::put(const char *serialized_data, std::size_t size) {
 
   ObjectDescriptor obj_desc{write(serialized_data, size)};
   if (obj_desc.status_ == ObjectStatus::Abort)
-    return false;
+    throw std::bad_alloc();
 
-  const uint64_t ring_buffer_offset{buf_desc.get_offset()};
-  auto *ring_buffer = offset_to_ptr<RingSlot>(ring_buffer_offset);
+  auto *ring_buffer =
+      offset_to_ptr<std::atomic<ObjectDescriptor>>(buf_desc.offset_);
 
   ring_buffer[bottom & (capacity - 1)].store(obj_desc,
                                              std::memory_order_relaxed);
 
   my_buffer_->bottom_.store(bottom + 1, std::memory_order_release);
+
+  if (ebr_cycles_since_advance_++ >= EBR_CYCLE_FORCE_ADVANCE) {
+    if (ebr_try_advance())
+      ebr_reclaim();
+    ebr_cycles_since_advance_ = 0;
+  }
+
   return true;
 }
 
 [[nodiscard]] ObjectDescriptor Deque::get() {
   int64_t bottom{my_buffer_->bottom_.load(std::memory_order_relaxed)};
   --bottom;
-  my_buffer_->bottom_.store(bottom, std::memory_order_relaxed);
+  my_buffer_->bottom_.store(bottom, std::memory_order_release);
 
   std::atomic_thread_fence(std::memory_order_seq_cst);
 
@@ -246,16 +243,15 @@ void Deque::put(const char *serialized_data, std::size_t size) {
   }
 
   if (top <= bottom) {
-    PackedRingDescriptor desc{
-        my_buffer_->descriptor_.load(std::memory_order_relaxed)};
     // Deque is nonempty
-    const uint64_t capacity{desc.get_capacity()};
-    const uint64_t ring_buffer_offset{desc.get_offset()};
-    auto *ring_buffer = offset_to_ptr<RingSlot>(ring_buffer_offset);
+    RingDescriptor desc{
+        my_buffer_->descriptor_.load(std::memory_order_relaxed)};
+    const uint64_t capacity{desc.capacity_};
+    auto *ring_buffer =
+        offset_to_ptr<std::atomic<ObjectDescriptor>>(desc.offset_);
 
     ObjectDescriptor item{
         ring_buffer[bottom & (capacity - 1)].load(std::memory_order_relaxed)};
-    recover_size(item);
 
     if (top != bottom)
       return item;
@@ -263,7 +259,7 @@ void Deque::put(const char *serialized_data, std::size_t size) {
     // Compete with possible thieves over the last item
     if (!my_buffer_->top_.compare_exchange_strong(
             top, top + 1, std::memory_order_seq_cst, std::memory_order_relaxed))
-      item = EMPTY;
+      item = ABORT;
 
     my_buffer_->bottom_.store(bottom + 1, std::memory_order_relaxed);
     return item;
@@ -320,11 +316,11 @@ void Deque::put(const char *serialized_data, std::size_t size) {
     return EMPTY;
   }
 
-  const PackedRingDescriptor desc{
+  const RingDescriptor desc{
       victim_buffer->descriptor_.load(std::memory_order_acquire)};
-  const uint64_t capacity{desc.get_capacity()};
-  const uint64_t ring_buffer_offset{desc.get_offset()};
-  auto *ring_buffer = offset_to_ptr<RingSlot>(ring_buffer_offset);
+  const uint64_t capacity{desc.capacity_};
+  auto *ring_buffer =
+      offset_to_ptr<std::atomic<ObjectDescriptor>>(desc.offset_);
 
   ObjectDescriptor item{
       ring_buffer[top & (capacity - 1)].load(std::memory_order_relaxed)};
@@ -334,14 +330,12 @@ void Deque::put(const char *serialized_data, std::size_t size) {
 
   ebr_unpin();
 
-  // TODO: Measure if this is causing too much contention.
-  if (ebr_try_advance())
+  if (cas_ok && ebr_try_advance())
     ebr_reclaim();
 
   if (!cas_ok)
     return ABORT;
 
-  recover_size(item);
   return item;
 }
 
@@ -355,10 +349,8 @@ void Deque::put(const char *serialized_data, std::size_t size) {
 [[nodiscard]] bool Deque::empty() const { return qsize() == 0; }
 
 [[nodiscard]] bool Deque::full() const {
-  PackedRingDescriptor desc{
-      my_buffer_->descriptor_.load(std::memory_order_relaxed)};
-  const uint64_t capacity{desc.get_capacity()};
-  return qsize() >= capacity;
+  RingDescriptor desc{my_buffer_->descriptor_.load(std::memory_order_relaxed)};
+  return qsize() >= desc.capacity_;
 }
 
 // TODO: Consier memory fragmentation issues
@@ -368,27 +360,22 @@ void Deque::put(const char *serialized_data, std::size_t size) {
   if (bin_idx < 0) [[unlikely]]
     return NULL_OFFSET;
 
-  uint64_t head{
+  FreeListHead head{
       registry_->free_lists_[bin_idx].head_.load(std::memory_order_acquire)};
 
   while (true) {
-    const uint64_t offset{head & FREE_LIST_OFFSET_MASK};
-    if (offset == NULL_OFFSET)
+    if (head.offset_ == NULL_OFFSET)
       break; // Fallback to bump allocator
 
+    auto *next_offset_ptr = offset_to_ptr<std::atomic<uint64_t>>(head.offset_);
     const uint64_t next_offset{
-        offset_to_ptr<std::atomic<uint64_t>>(offset)->load(
-            std::memory_order_relaxed) &
-        FREE_LIST_OFFSET_MASK};
-
-    const uint64_t current_tag_bits{head & ~FREE_LIST_OFFSET_MASK};
-    const uint64_t new_head{current_tag_bits | next_offset};
+        next_offset_ptr->load(std::memory_order_relaxed)};
+    FreeListHead new_head{next_offset, head.tag_};
 
     if (registry_->free_lists_[bin_idx].head_.compare_exchange_weak(
             head, new_head, std::memory_order_acquire,
-            std::memory_order_acquire)) {
-      return offset;
-    }
+            std::memory_order_acquire))
+      return head.offset_;
   }
 
   // Fallback to bump allocation. Allocate the entire bin (not just capacity) so
@@ -422,20 +409,19 @@ void Deque::free(uint64_t offset, uint64_t capacity) {
 
   const int bin_idx{
       calculate_bin(capacity, MIN_FREE_LIST_BIN_CAP, NUM_FREE_LIST_BINS)};
+
   if (bin_idx < 0) [[unlikely]]
     return;
 
-  auto *next_ptr = offset_to_ptr<std::atomic<uint64_t>>(offset);
+  auto *next_ptr = offset_to_ptr<uint64_t>(offset);
 
-  uint64_t head{
+  FreeListHead head{
       registry_->free_lists_[bin_idx].head_.load(std::memory_order_relaxed)};
 
   while (true) {
-    next_ptr->store(head & FREE_LIST_OFFSET_MASK, std::memory_order_relaxed);
-
-    // Extract tag, increment it, and combine it with the newly freed offset.
-    const uint64_t next_tag{((head >> ABA_TAG_SHIFT) + 1) << ABA_TAG_SHIFT};
-    const uint64_t new_head{next_tag | (offset & FREE_LIST_OFFSET_MASK)};
+    std::atomic_ref<uint64_t>(*next_ptr).store(head.offset_,
+                                               std::memory_order_relaxed);
+    FreeListHead new_head{.offset_ = offset, .tag_ = head.tag_ + 1};
 
     if (registry_->free_lists_[bin_idx].head_.compare_exchange_weak(
             head, new_head, std::memory_order_release,
@@ -444,20 +430,32 @@ void Deque::free(uint64_t offset, uint64_t capacity) {
   }
 }
 
+void Deque::release(ObjectDescriptor &desc) noexcept {
+  if (desc.status_ != ObjectStatus::Ok || desc.offset_ == NULL_OFFSET)
+    return;
+  ebr_retire(desc.offset_, static_cast<uint64_t>(desc.size_));
+  if (ebr_try_advance())
+    ebr_reclaim();
+  desc.status_ = ObjectStatus::Empty;
+  desc.offset_ = NULL_OFFSET;
+}
+
 [[nodiscard]] bool Deque::grow(uint64_t current_capacity) {
-  const PackedRingDescriptor desc{
+  const RingDescriptor desc{
       my_buffer_->descriptor_.load(std::memory_order_relaxed)};
-  const uint64_t old_offset{desc.get_offset()};
-  const uint64_t old_size{current_capacity * sizeof(RingSlot)};
+  const uint64_t old_offset{desc.offset_};
+  const uint64_t old_size{current_capacity *
+                          sizeof(std::atomic<ObjectDescriptor>)};
 
   const uint64_t new_capacity{current_capacity * 2};
-  const uint64_t new_offset{allocate(new_capacity * sizeof(RingSlot))};
+  const uint64_t new_offset{
+      allocate(new_capacity * sizeof(std::atomic<ObjectDescriptor>))};
 
   if (new_offset == NULL_OFFSET) [[unlikely]]
     return false;
 
-  auto *old_ring = offset_to_ptr<RingSlot>(old_offset);
-  auto *new_ring = offset_to_ptr<RingSlot>(new_offset);
+  auto *old_ring = offset_to_ptr<std::atomic<ObjectDescriptor>>(old_offset);
+  auto *new_ring = offset_to_ptr<std::atomic<ObjectDescriptor>>(new_offset);
 
   const int64_t bottom{my_buffer_->bottom_.load(std::memory_order_relaxed)};
   const int64_t top{my_buffer_->top_.load(std::memory_order_acquire)};
@@ -469,25 +467,27 @@ void Deque::free(uint64_t offset, uint64_t capacity) {
     new_ring[i & (new_capacity - 1)].store(item, std::memory_order_relaxed);
   }
 
-  PackedRingDescriptor new_desc(new_offset, new_capacity);
+  RingDescriptor new_desc{.offset_ = new_offset, .capacity_ = new_capacity};
   my_buffer_->descriptor_.store(new_desc, std::memory_order_release);
 
   ebr_retire(old_offset, old_size);
   ebr_try_advance();
-  ebr_reclaim();
 
   return true;
 }
 
 void Deque::cleanup() noexcept {
+  int64_t num_active_processes{-1};
   if (registry_ != nullptr && queue_idx_ != -1) {
     registry_->live_mask_.fetch_and(~(1ULL << queue_idx_),
                                     std::memory_order_release);
     if (process_count_incremented_) {
-      registry_->num_active_processes_.fetch_sub(1, std::memory_order_acq_rel);
+      num_active_processes = registry_->num_active_processes_.fetch_sub(
+          1, std::memory_order_acq_rel);
       process_count_incremented_ = false;
     }
     queue_idx_ = -1;
+    registry_ = nullptr;
   }
 
   if (base_address_ != nullptr && base_address_ != MAP_FAILED) {
@@ -500,10 +500,8 @@ void Deque::cleanup() noexcept {
     shm_fd_ = -1;
   }
 
-  if (is_creator_) {
+  if (num_active_processes == 1)
     shm_unlink(shm_name_.c_str());
-    is_creator_ = false;
-  }
 }
 
 void Deque::ebr_pin() noexcept {
