@@ -129,14 +129,36 @@ public:
   // Never resizes the buffer, returns false if capacity is reached.
   [[nodiscard]] bool try_put(const char *serialized_data, std::size_t size);
 
+  /**
+   * @brief Attempts to remove and returns the newest item from this deque.
+   *
+   * @return An `ObjectDescriptor` containing the removed newest item from this
+   * deque, `EMPTY` if this deque is empty, and `ABORT` on failure. Users should
+   * retry after `ABORT`.
+   */
   [[nodiscard]] ObjectDescriptor get();
-  // TODO: Implement the optional params
-  [[nodiscard]] ObjectDescriptor
-      steal(/*int64_t target_victim, bool target_longest*/);
 
-  // Results unreliable
+  /**
+   * @brief Attempts to remove and returns the oldest item from another deque.
+   *
+   * @param[in] target_longest [optional] If `true`, attempts to steal from the
+   * deque with the most items. If `false`, chooses a random deque uniformly,
+   * not necessarily nonempty. Largest size result unreliable. (Default: false)
+   *
+   * @return An `ObjectDescriptor` containing the removed oldest item from the
+   * selected deque, `EMPTY` if there are no valid deques or the selected deque
+   * contains no elements, and `ABORT` on failure. Users should retry after
+   * `ABORT`.
+   */
+  [[nodiscard]] ObjectDescriptor steal(bool target_longest = false);
+
+  // Returns the approximate size of this deque. Results unreliable.
   [[nodiscard]] std::size_t qsize() const;
+
+  // Returns `true` if this deque is empty. Results unreliable.
   [[nodiscard]] bool empty() const;
+
+  // Returns `true` if this deque is full. Results unreliable.
   [[nodiscard]] bool full() const;
 
   // CRITICAL IMPORTANT: This should be called after the returned Python object
@@ -147,6 +169,7 @@ public:
 
 private:
   // --- Deque state helpers ---
+
   [[nodiscard]] bool grow(uint64_t current_capacity);
 
   // TODO: Shrink buffers at low usage
@@ -154,12 +177,14 @@ private:
   void cleanup() noexcept;
 
   // --- Data access helpers ---
+
   [[nodiscard]] ObjectDescriptor write(const char *serialized_data,
                                        std::size_t size);
   [[nodiscard]] const char *
   payload_ptr(const ObjectDescriptor &d) const noexcept;
 
   // --- Memory management helpers ---
+
   // Returns the byte offset of a memory block large enough for `capacity`
   // bytes, or NULL_OFFSET (0) if out of memory or unsupported capacity.
   [[nodiscard]] uint64_t allocate(uint64_t capacity);
@@ -167,6 +192,7 @@ private:
   void free(uint64_t offset, uint64_t capacity);
 
   // --- Pointer arithmetic helpers ---
+
   template <typename T>
   [[nodiscard]] inline T *offset_to_ptr(uint64_t offset) const noexcept {
     if (offset == 0)

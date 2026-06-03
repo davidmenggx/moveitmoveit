@@ -270,24 +270,53 @@ void Deque::put(const char *serialized_data, std::size_t size) {
   }
 }
 
-// TODO: Perhaps modify steal to choose the queue with the most items.
-[[nodiscard]] ObjectDescriptor Deque::steal() {
+[[nodiscard]] ObjectDescriptor Deque::steal(bool target_longest) {
   uint64_t candidates = registry_->live_mask_.load(std::memory_order_acquire) &
                         ~(1ULL << queue_idx_);
   if (candidates == 0)
     return EMPTY;
 
-  const int num_candidates{std::popcount(candidates)};
-  const int pick{rng_.random<int>(0, num_candidates - 1)};
-  uint64_t temp{candidates};
-  for (int i{0}; i < pick; ++i)
-    temp &= temp - 1;
-  const int victim_idx{std::countr_zero(temp)};
+  int victim_idx{-1};
+
+  if (target_longest) {
+    int64_t maximum_size{-1};
+    for (int idx{0}; idx < MAX_BUFFERS; ++idx) {
+      if ((candidates & (1ULL << idx)) == 0)
+        continue;
+
+      const uint64_t candidate_buf_offset{
+          registry_->buffer_offsets_[idx].value_.load(
+              std::memory_order_acquire)};
+      if (candidate_buf_offset == NULL_OFFSET)
+        continue;
+
+      auto *candidate_buffer = offset_to_ptr<Buffer>(candidate_buf_offset);
+
+      const int64_t top{candidate_buffer->top_.load(std::memory_order_relaxed)};
+      const int64_t bottom{
+          candidate_buffer->bottom_.load(std::memory_order_relaxed)};
+      const int64_t current_size{bottom - top};
+      if (current_size > maximum_size) {
+        maximum_size = current_size;
+        victim_idx = idx;
+      }
+    }
+
+    if (victim_idx == -1)
+      return EMPTY;
+
+  } else {
+    const int num_candidates{std::popcount(candidates)};
+    const int pick{rng_.random<int>(0, num_candidates - 1)};
+    uint64_t temp{candidates};
+    for (int i{0}; i < pick; ++i)
+      temp &= temp - 1;
+    victim_idx = std::countr_zero(temp);
+  }
 
   const uint64_t victim_buf_offset{
       registry_->buffer_offsets_[victim_idx].value_.load(
           std::memory_order_acquire)};
-
   if (victim_buf_offset == NULL_OFFSET)
     return EMPTY;
 
