@@ -11,14 +11,13 @@ requires-python = ">=3.9"
 authors = [
     { name = "David Meng", email = "davidmenggx@gmail.com" }
 ]
-dependencies = []
+dependencies = ["nanobind>=2.0.0"]
 
 [tool.scikit-build]
 cmake.version = ">=3.18"
 ninja.version = ">=1.10"
-editable.rebuild = true
 build-dir = "build/{wheel_tag}"
 
-[tool.scikit-build.cmake.define]
-BUILD_TESTING = "OFF"
-
+[tool.scikit-build.editable]
+rebuild = true
+mode = "redirect"

@@ -58,7 +58,7 @@ struct alignas(CACHE_LINE_SIZE) Buffer {
 // Memory allocation constants
 inline constexpr uint64_t NULL_OFFSET{0};
 inline constexpr int MIN_FREE_LIST_BIN_CAP{6}; // Buckets store 2^6 = 64 objects
-inline constexpr int NUM_FREE_LIST_BINS{25};
+inline constexpr int NUM_FREE_LIST_BINS{27};
 
 // Metadata to prevent race conditions in the segregated free list.
 struct alignas(16) FreeListHead {
@@ -73,12 +73,12 @@ static_assert(std::atomic<FreeListHead>::is_always_lock_free,
 
 // Metadata on the shared memory state.
 struct Registry {
-  std::atomic<int64_t> num_active_processes_{0};
-  std::atomic<uint64_t> live_mask_{0};
-  std::atomic<uint64_t> global_segement_size_{0};
+  alignas(CACHE_LINE_SIZE) std::atomic<int64_t> num_active_processes_{0};
+  alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> live_mask_{0};
+  alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> global_segement_size_{0};
 
   // For the bump allocator
-  std::atomic<uint64_t> unallocated_memory_top_{
+  alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> unallocated_memory_top_{
       (sizeof(Registry) + CACHE_LINE_SIZE - 1) & ~(CACHE_LINE_SIZE - 1)};
 
   struct alignas(CACHE_LINE_SIZE) PaddedFreeList {
@@ -150,7 +150,8 @@ public:
    * contains no elements, and `ABORT` on failure. Users should retry after
    * `ABORT`.
    */
-  [[nodiscard]] ObjectDescriptor steal(bool target_longest = false);
+  [[nodiscard]] ObjectDescriptor steal(bool target_longest = false,
+                                       bool target_first = false);
 
   // Returns the approximate size of this deque. Results unreliable.
   [[nodiscard]] std::size_t qsize() const;

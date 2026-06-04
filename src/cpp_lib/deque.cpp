@@ -109,7 +109,9 @@ Deque::Deque(std::string group_id, std::size_t total_memory_capacity_mb)
   }
 
   const uint64_t buf_offset{registry_->unallocated_memory_top_.fetch_add(
-      sizeof(Buffer), std::memory_order_relaxed)};
+      (sizeof(Buffer) + CACHE_LINE_SIZE - 1) &
+          ~(CACHE_LINE_SIZE - 1), // Align up
+      std::memory_order_relaxed)};
   my_buffer_ = new (offset_to_ptr<void>(buf_offset)) Buffer();
   registry_->buffer_offsets_[queue_idx_].value_.store(
       buf_offset, std::memory_order_release);
@@ -157,7 +159,10 @@ Deque::~Deque() noexcept {
 
 void Deque::put(const char *serialized_data, std::size_t size) {
   const int64_t bottom{my_buffer_->bottom_.load(std::memory_order_relaxed)};
-  const int64_t top{my_buffer_->top_.load(std::memory_order_acquire)};
+  const int64_t top{my_buffer_->top_.load(
+      std::memory_order_relaxed)}; // TODO: This was acquire but switched to
+                                   // relax since a stale result just results in
+                                   // an unneeded grow, which is still correct.
   RingDescriptor buf_desc{
       my_buffer_->descriptor_.load(std::memory_order_relaxed)};
   uint64_t capacity{buf_desc.capacity_};
@@ -203,7 +208,7 @@ void Deque::put(const char *serialized_data, std::size_t size) {
 
   ObjectDescriptor obj_desc{write(serialized_data, size)};
   if (obj_desc.status_ == ObjectStatus::Abort)
-    throw std::bad_alloc();
+    return false;
 
   auto *ring_buffer =
       offset_to_ptr<std::atomic<ObjectDescriptor>>(buf_desc.offset_);
@@ -265,7 +270,8 @@ void Deque::put(const char *serialized_data, std::size_t size) {
   }
 }
 
-[[nodiscard]] ObjectDescriptor Deque::steal(bool target_longest) {
+[[nodiscard]] ObjectDescriptor Deque::steal(bool target_longest,
+                                            bool target_first) {
   uint64_t candidates = registry_->live_mask_.load(std::memory_order_acquire) &
                         ~(1ULL << queue_idx_);
   if (candidates == 0)
@@ -273,7 +279,38 @@ void Deque::put(const char *serialized_data, std::size_t size) {
 
   int victim_idx{-1};
 
-  if (target_longest) {
+  if (target_first) {
+    uint64_t temp_candidates = candidates;
+
+    while (temp_candidates != 0) {
+      // Get the lowest active bit
+      int idx = std::countr_zero(temp_candidates);
+
+      const uint64_t candidate_buf_offset =
+          registry_->buffer_offsets_[idx].value_.load(
+              std::memory_order_acquire);
+
+      if (candidate_buf_offset != NULL_OFFSET) {
+        auto *candidate_buffer = offset_to_ptr<Buffer>(candidate_buf_offset);
+
+        const int64_t top{
+            candidate_buffer->top_.load(std::memory_order_relaxed)};
+        const int64_t bottom{
+            candidate_buffer->bottom_.load(std::memory_order_relaxed)};
+
+        if (bottom > top) {
+          victim_idx = idx;
+          break;
+        }
+      }
+
+      temp_candidates &= temp_candidates - 1;
+    }
+
+    if (victim_idx == -1)
+      return EMPTY;
+
+  } else if (target_longest) {
     int64_t maximum_size{-1};
     for (int idx{0}; idx < MAX_BUFFERS; ++idx) {
       if ((candidates & (1ULL << idx)) == 0)
@@ -364,7 +401,7 @@ void Deque::put(const char *serialized_data, std::size_t size) {
 }
 
 [[nodiscard]] std::size_t Deque::qsize() const {
-  const int64_t top{my_buffer_->top_.load(std::memory_order_acquire)};
+  const int64_t top{my_buffer_->top_.load(std::memory_order_relaxed)};
   const int64_t bottom{my_buffer_->bottom_.load(std::memory_order_relaxed)};
   const int64_t current_size{bottom - top};
   return current_size < 0 ? 0 : static_cast<std::size_t>(current_size);
@@ -391,9 +428,9 @@ void Deque::put(const char *serialized_data, std::size_t size) {
     if (head.offset_ == NULL_OFFSET)
       break; // Fallback to bump allocator
 
-    auto *next_offset_ptr = offset_to_ptr<std::atomic<uint64_t>>(head.offset_);
-    const uint64_t next_offset{
-        next_offset_ptr->load(std::memory_order_relaxed)};
+    auto *next_offset_ptr = offset_to_ptr<uint64_t>(head.offset_);
+    const uint64_t next_offset{std::atomic_ref<uint64_t>(*next_offset_ptr)
+                                   .load(std::memory_order_relaxed)};
     FreeListHead new_head{next_offset, head.tag_};
 
     if (registry_->free_lists_[bin_idx].head_.compare_exchange_weak(
@@ -410,9 +447,8 @@ void Deque::put(const char *serialized_data, std::size_t size) {
       registry_->unallocated_memory_top_.load(std::memory_order_relaxed)};
 
   while (true) {
-    uint64_t alignment{CACHE_LINE_SIZE};
-    const uint64_t aligned_top{(old_top + alignment - 1) &
-                               ~(alignment - 1)}; // Align up
+    const uint64_t aligned_top{(old_top + CACHE_LINE_SIZE - 1) &
+                               ~(CACHE_LINE_SIZE - 1)}; // Align up
     const uint64_t new_top{aligned_top + bytes_needed};
 
     if (new_top > registry_->global_segement_size_.load(
@@ -499,7 +535,8 @@ void Deque::release(ObjectDescriptor &desc) noexcept {
   my_buffer_->descriptor_.store(new_desc, std::memory_order_release);
 
   ebr_retire(old_offset, old_size);
-  ebr_try_advance();
+  if (ebr_try_advance())
+    ebr_reclaim();
 
   return true;
 }
@@ -507,6 +544,8 @@ void Deque::release(ObjectDescriptor &desc) noexcept {
 void Deque::cleanup() noexcept {
   int64_t num_active_processes{-1};
   if (registry_ != nullptr && queue_idx_ != -1) {
+    registry_->buffer_offsets_[queue_idx_].value_.store(
+        NULL_OFFSET, std::memory_order_release);
     registry_->live_mask_.fetch_and(~(1ULL << queue_idx_),
                                     std::memory_order_release);
     if (process_count_incremented_) {
@@ -542,8 +581,9 @@ void Deque::ebr_pin() noexcept {
 }
 
 void Deque::ebr_unpin() noexcept {
-  registry_->pinned_epochs_[queue_idx_].value_.store(Registry::EBR_UNPINNED,
-                                                     std::memory_order_release);
+  if (registry_ != nullptr && queue_idx_ >= 0)
+    registry_->pinned_epochs_[queue_idx_].value_.store(
+        Registry::EBR_UNPINNED, std::memory_order_release);
 }
 
 void Deque::ebr_retire(uint64_t offset, uint64_t size_bytes) noexcept {

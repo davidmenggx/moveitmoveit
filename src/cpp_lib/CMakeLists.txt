@@ -15,3 +15,11 @@ endif()
 
 install(TARGETS moveitmoveit_ext DESTINATION moveitmoveit)
 
+add_custom_command(
+    TARGET moveitmoveit_ext POST_BUILD
+    COMMAND ${Python_EXECUTABLE} -m nanobind.stubgen 
+            -m moveitmoveit_ext 
+            -O ${CMAKE_SOURCE_DIR}/src/moveitmoveit
+            COMMENT "Generating Python stub file (.pyi)"
+)
+

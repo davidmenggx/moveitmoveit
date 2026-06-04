@@ -8,10 +8,5 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
 find_package(nanobind CONFIG REQUIRED)
 
-add_subdirectory(src/ext)
-
-if(BUILD_TESTING)
-  enable_testing()
-  add_subdirectory(tests)
-endif()
+add_subdirectory(src/cpp_lib)
 

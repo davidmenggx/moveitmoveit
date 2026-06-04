@@ -14,17 +14,17 @@ struct EmptyException : public std::exception {
 
 struct AbortException : public std::exception {
   const char *what() const noexcept override {
-    return "Queue operation aborted.";
+    return "Queue operation safely aborted, please retry.";
   }
 };
 
 NB_MODULE(moveitmoveit_ext, m) {
-  nb::exception<EmptyException> exc_empty(m, "Empty");
   nb::exception<AbortException> exc_abort(m, "Abort");
+  nb::exception<EmptyException> exc_empty(m, "Empty");
 
   nb::object pickle = nb::module_::import_("pickle");
 
-  nb::class_<Deque>(m, "Queue")
+  nb::class_<Deque>(m, "Deque")
       .def(nb::init<std::string, std::size_t>(), nb::arg("group_id"),
            nb::arg("total_memory_capacity_mb") = 16384)
 
@@ -50,26 +50,37 @@ NB_MODULE(moveitmoveit_ext, m) {
 
       .def("get",
            [pickle](Deque &d) {
-             ObjectDescriptor desc = d.get();
+             ObjectDescriptor desc = ABORT;
+             {
+               nb::gil_scoped_release release;
+               desc = d.get();
+             }
 
-             if (desc == EMPTY)
-               throw EmptyException();
              if (desc == ABORT)
                throw AbortException();
+             if (desc == EMPTY)
+               throw EmptyException();
 
              const char *ptr = d.get_data_ptr(desc.offset_);
 
              nb::bytes py_bytes(ptr, desc.size_);
 
-             d.release(desc);
+             {
+               nb::gil_scoped_release release;
+               d.release(desc);
+             }
 
              return pickle.attr("loads")(py_bytes);
            })
 
       .def(
           "steal",
-          [pickle](Deque &d, bool target_longest) {
-            ObjectDescriptor desc = d.steal(target_longest);
+          [pickle](Deque &d, bool target_longest, bool target_first) {
+            ObjectDescriptor desc = ABORT;
+            {
+              nb::gil_scoped_release release;
+              desc = d.steal(target_longest, target_first);
+            }
 
             if (desc == EMPTY)
               throw EmptyException();
@@ -78,11 +89,15 @@ NB_MODULE(moveitmoveit_ext, m) {
 
             const char *ptr = d.get_data_ptr(desc.offset_);
             nb::bytes py_bytes(ptr, desc.size_);
-            d.release(desc);
+
+            {
+              nb::gil_scoped_release release;
+              d.release(desc);
+            }
 
             return pickle.attr("loads")(py_bytes);
           },
-          nb::arg("target_longest") = false)
+          nb::arg("target_longest") = false, nb::arg("target_first") = false)
 
       .def("qsize", &Deque::qsize)
       .def("empty", &Deque::empty)
