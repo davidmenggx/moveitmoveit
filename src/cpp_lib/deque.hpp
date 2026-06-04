@@ -2,13 +2,11 @@
 
 #include "utils/rng.hpp"
 
-#include <array>
 #include <atomic>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <string>
-#include <vector>
 
 namespace moveitmoveit {
 inline constexpr std::size_t CACHE_LINE_SIZE = 64;
@@ -71,6 +69,14 @@ struct alignas(16) FreeListHead {
 static_assert(std::atomic<FreeListHead>::is_always_lock_free,
               "CRITICAL: FreeListHead (128 bits) must be lock free");
 
+// Metadata for tracking a retired buffer within shared memory.
+struct RetireNode {
+  uint64_t offset_{0};
+  uint64_t size_bytes_{0};
+  uint64_t next_{0};
+  uint64_t retire_epoch_{0};
+};
+
 // Metadata on the shared memory state.
 struct Registry {
   alignas(CACHE_LINE_SIZE) std::atomic<int64_t> num_active_processes_{0};
@@ -104,6 +110,20 @@ struct Registry {
     std::atomic<uint64_t> value_{EBR_UNPINNED};
   };
   PinnedEpoch pinned_epochs_[MAX_BUFFERS];
+
+  // Prevent EBR from getting stuck when a process crashes.
+  static constexpr uint64_t EBR_PIN_TIMEOUT_NS{5'000'000'000ULL}; // 5s
+  struct alignas(CACHE_LINE_SIZE) Heartbeat {
+    std::atomic<uint64_t> last_seen_ns_{0};
+  };
+  Heartbeat heartbeats_[MAX_BUFFERS];
+
+  // In shared memory
+  struct alignas(CACHE_LINE_SIZE) ProcessRetireHeads {
+    std::atomic<uint64_t> epoch_lists_[3]{NULL_OFFSET, NULL_OFFSET,
+                                          NULL_OFFSET};
+  };
+  ProcessRetireHeads retire_heads_[MAX_BUFFERS];
 };
 
 // Constructor retry constants
@@ -168,7 +188,7 @@ public:
   // same `ObjectDescriptor` twice.
   void release(ObjectDescriptor &desc) noexcept;
 
-  // Python bindings helper
+  // Python binding data access helper.
   [[nodiscard]] const char *get_data_ptr(uint64_t offset) const noexcept;
 
 private:
@@ -228,30 +248,23 @@ private:
 
   // --- Epoch based reclamation state ---
   static constexpr int EBR_EPOCHS = 3;
-  struct RetiredBuffer {
-    uint64_t offset_;
-    uint64_t size_bytes_;
-  };
-
-  // TODO: There is a memory leak here when a process drops out, as its vector
-  // and array are cleared but the underlying buffer is lost. We should replace
-  // this heap-local array<vector> to shared memory.
-  std::array<std::vector<RetiredBuffer>, EBR_EPOCHS> retire_lists_{};
   static constexpr int EBR_CYCLE_FORCE_ADVANCE = 128;
   int ebr_cycles_since_advance_{0};
 
   // --- Epoch based reclamation helpers ---
 
-  // Call prior to entering the critical section.
   void ebr_pin() noexcept;
 
-  // Call upon leaving the critical section so the application can progress.
   void ebr_unpin() noexcept;
 
   void ebr_retire(uint64_t offset, uint64_t size_bytes) noexcept;
 
   // Returns `false` and fails if a process is in an older epoch.
   bool ebr_try_advance() noexcept;
+
   void ebr_reclaim() noexcept;
+
+  // Remove a stalled process that times out.
+  void evict_slot(int idx) noexcept;
 };
 } // namespace moveitmoveit

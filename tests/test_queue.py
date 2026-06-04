@@ -23,6 +23,26 @@ def test_put_get():
     with pytest.raises(Empty):
         item = q.get()
 
+def test_put_get_view():
+    q = Deque('test')
+    q.put_buffer(b'Hello world')
+    
+    sz = q.qsize()
+    assert sz == 1, f'Invalid size: expected 1, received {sz}'
+
+    view = q.get_view()
+    mv = memoryview(view)
+    assert bytes(mv) == b'Hello world', f"Invalid item from `get()`: expected b'Hello world', received {bytes(mv)}"
+    
+    sz = q.qsize()
+    assert sz == 0, f'Invalid size: expected 0, received {sz}'
+
+    mt = q.empty()
+    assert mt, f'Invalid size: expected `q.empty() == True`, received `q.empty() == {mt}`'
+
+    with pytest.raises(Empty):
+        item = q.get()
+
 def test_various_type_objs():
     q = Deque('test')
 
@@ -58,6 +78,27 @@ def test_steal_basic():
     with pytest.raises(Empty):
         item = q1.steal()
         item = q2.steal()
+
+def test_steal_basic_view():
+    q1 = Deque('test')
+    q2 = Deque('test')
+
+    with pytest.raises(Empty):
+        item = q1.steal_view()
+        item = q2.steal_view()
+
+    q1.put_buffer(b'i like to')
+
+    with pytest.raises(Empty): # `q1` receives `Empty` because `q2` is empty and you cannot steal from yourself
+        item = q1.steal_view()
+
+    view = q2.steal_view()
+    mv = memoryview(view)
+    assert bytes(mv) == b'i like to', f"Invalid item from `steal()`: expected b'i like to', received {bytes(item)}"
+
+    with pytest.raises(Empty):
+        item = q1.steal_view()
+        item = q2.steal_view()
 
 def test_steal_longest():
     q1 = Deque('test')

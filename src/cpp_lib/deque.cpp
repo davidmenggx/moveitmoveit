@@ -1,5 +1,6 @@
 #include "deque.hpp"
 #include "utils/calculate_bin.hpp"
+#include "utils/monotonic_ns.hpp"
 #include "utils/valid_shm_name.hpp"
 
 #include <atomic>
@@ -160,7 +161,7 @@ Deque::~Deque() noexcept {
 void Deque::put(const char *serialized_data, std::size_t size) {
   const int64_t bottom{my_buffer_->bottom_.load(std::memory_order_relaxed)};
   const int64_t top{my_buffer_->top_.load(
-      std::memory_order_relaxed)}; // TODO: This was acquire but switched to
+      std::memory_order_relaxed)}; // This was acquire but switched to
                                    // relax since a stale result just results in
                                    // an unneeded grow, which is still correct.
   RingDescriptor buf_desc{
@@ -208,7 +209,7 @@ void Deque::put(const char *serialized_data, std::size_t size) {
 
   ObjectDescriptor obj_desc{write(serialized_data, size)};
   if (obj_desc.status_ == ObjectStatus::Abort)
-    return false;
+    throw std::bad_alloc();
 
   auto *ring_buffer =
       offset_to_ptr<std::atomic<ObjectDescriptor>>(buf_desc.offset_);
@@ -272,23 +273,22 @@ void Deque::put(const char *serialized_data, std::size_t size) {
 
 [[nodiscard]] ObjectDescriptor Deque::steal(bool target_longest,
                                             bool target_first) {
-  uint64_t candidates = registry_->live_mask_.load(std::memory_order_acquire) &
-                        ~(1ULL << queue_idx_);
+  uint64_t candidates{registry_->live_mask_.load(std::memory_order_acquire) &
+                      ~(1ULL << queue_idx_)};
   if (candidates == 0)
     return EMPTY;
 
   int victim_idx{-1};
 
   if (target_first) {
-    uint64_t temp_candidates = candidates;
+    uint64_t temp_candidates{candidates};
 
     while (temp_candidates != 0) {
       // Get the lowest active bit
-      int idx = std::countr_zero(temp_candidates);
-
-      const uint64_t candidate_buf_offset =
+      int idx{std::countr_zero(temp_candidates)};
+      const uint64_t candidate_buf_offset{
           registry_->buffer_offsets_[idx].value_.load(
-              std::memory_order_acquire);
+              std::memory_order_acquire)};
 
       if (candidate_buf_offset != NULL_OFFSET) {
         auto *candidate_buffer = offset_to_ptr<Buffer>(candidate_buf_offset);
@@ -414,7 +414,7 @@ void Deque::put(const char *serialized_data, std::size_t size) {
   return qsize() >= desc.capacity_;
 }
 
-// TODO: Consier memory fragmentation issues
+// TODO: Consider memory fragmentation issues
 [[nodiscard]] uint64_t Deque::allocate(uint64_t capacity) {
   const int bin_idx{
       calculate_bin(capacity, MIN_FREE_LIST_BIN_CAP, NUM_FREE_LIST_BINS)};
@@ -548,10 +548,30 @@ void Deque::cleanup() noexcept {
         NULL_OFFSET, std::memory_order_release);
     registry_->live_mask_.fetch_and(~(1ULL << queue_idx_),
                                     std::memory_order_release);
+
     if (process_count_incremented_) {
       num_active_processes = registry_->num_active_processes_.fetch_sub(
           1, std::memory_order_acq_rel);
       process_count_incremented_ = false;
+
+      // Last process out should clean up all retired memory offsets. As last
+      // process, there is no contention with other processes.
+      if (num_active_processes == 1) {
+        for (int idx{0}; idx < MAX_BUFFERS; ++idx) {
+          for (int e{0}; e < EBR_EPOCHS; ++e) {
+            uint64_t head_offset{
+                registry_->retire_heads_[idx].epoch_lists_[e].exchange(
+                    NULL_OFFSET, std::memory_order_relaxed)};
+            while (head_offset != NULL_OFFSET) {
+              RetireNode *node{offset_to_ptr<RetireNode>(head_offset)};
+              uint64_t next_offset{node->next_};
+              free(node->offset_, node->size_bytes_);
+              free(head_offset, sizeof(RetireNode));
+              head_offset = next_offset;
+            }
+          }
+        }
+      }
     }
     queue_idx_ = -1;
     registry_ = nullptr;
@@ -572,6 +592,9 @@ void Deque::cleanup() noexcept {
 }
 
 void Deque::ebr_pin() noexcept {
+  registry_->heartbeats_[queue_idx_].last_seen_ns_.store(
+      monotonic_ns(), std::memory_order_seq_cst);
+
   uint64_t epoch{};
   do {
     epoch = registry_->global_epoch_.load(std::memory_order_acquire);
@@ -587,25 +610,60 @@ void Deque::ebr_unpin() noexcept {
 }
 
 void Deque::ebr_retire(uint64_t offset, uint64_t size_bytes) noexcept {
+  ebr_pin();
   const uint64_t epoch{
       registry_->global_epoch_.load(std::memory_order_acquire)};
-  retire_lists_[epoch % EBR_EPOCHS].push_back({offset, size_bytes});
+  const int epoch_idx{static_cast<int>(epoch % EBR_EPOCHS)};
+
+  const uint64_t node_offset{allocate(sizeof(RetireNode))};
+  if (node_offset == NULL_OFFSET) {
+    ebr_unpin();
+    return; // Out of memory
+  }
+
+  RetireNode *node{offset_to_ptr<RetireNode>(node_offset)};
+  node->offset_ = offset;
+  node->size_bytes_ = size_bytes;
+  node->retire_epoch_ = epoch;
+
+  uint64_t old_head{
+      registry_->retire_heads_[queue_idx_].epoch_lists_[epoch_idx].load(
+          std::memory_order_relaxed)};
+  do {
+    node->next_ = old_head;
+  } while (!registry_->retire_heads_[queue_idx_]
+                .epoch_lists_[epoch_idx]
+                .compare_exchange_weak(old_head, node_offset,
+                                       std::memory_order_release,
+                                       std::memory_order_relaxed));
+
+  ebr_unpin();
 }
 
 bool Deque::ebr_try_advance() noexcept {
   uint64_t global{registry_->global_epoch_.load(std::memory_order_acquire)};
   uint64_t mask{registry_->live_mask_.load(std::memory_order_acquire)};
+  const uint64_t now{monotonic_ns()};
 
   uint64_t temp{mask};
   while (temp) {
-    const int idx = std::countr_zero(temp);
+    const int idx{std::countr_zero(temp)};
     temp &= temp - 1;
 
-    const uint64_t pinned =
-        registry_->pinned_epochs_[idx].value_.load(std::memory_order_acquire);
-    if (pinned != Registry::EBR_UNPINNED && pinned != global)
-      return false; // Someone is still in a critical section at an older
-                    // epoch.
+    const uint64_t pinned{
+        registry_->pinned_epochs_[idx].value_.load(std::memory_order_acquire)};
+    if (pinned == Registry::EBR_UNPINNED || pinned == global)
+      continue;
+
+    if (idx == queue_idx_)
+      return false; // Never evict ourselves
+
+    const uint64_t hb{registry_->heartbeats_[idx].last_seen_ns_.load(
+        std::memory_order_acquire)};
+    if (now - hb < Registry::EBR_PIN_TIMEOUT_NS)
+      return false; // Alive
+
+    evict_slot(idx);
   }
 
   return registry_->global_epoch_.compare_exchange_strong(
@@ -616,12 +674,44 @@ void Deque::ebr_reclaim() noexcept {
   const uint64_t global{
       registry_->global_epoch_.load(std::memory_order_acquire)};
   if (global < 2)
-    return; // Not enough epochs have elapsed yet.
+    return;
 
-  auto &list = retire_lists_[(global - 2) % EBR_EPOCHS];
-  for (const auto &rb : list)
-    free(rb.offset_, rb.size_bytes_);
-  list.clear();
+  const int reclaim_epoch_idx{static_cast<int>((global - 2) % EBR_EPOCHS)};
+
+  for (int idx{0}; idx < MAX_BUFFERS; ++idx) {
+    uint64_t head_offset{
+        registry_->retire_heads_[idx].epoch_lists_[reclaim_epoch_idx].exchange(
+            NULL_OFFSET, std::memory_order_acquire)};
+
+    while (head_offset != NULL_OFFSET) {
+      RetireNode *node{offset_to_ptr<RetireNode>(head_offset)};
+      const uint64_t next_offset{node->next_};
+
+      if (node->retire_epoch_ + 2 <= global) {
+        free(node->offset_, node->size_bytes_);
+        free(head_offset, sizeof(RetireNode));
+      } else {
+        uint64_t old_head{
+            registry_->retire_heads_[idx].epoch_lists_[reclaim_epoch_idx].load(
+                std::memory_order_relaxed)};
+        do {
+          node->next_ = old_head;
+        } while (!registry_->retire_heads_[idx]
+                      .epoch_lists_[reclaim_epoch_idx]
+                      .compare_exchange_weak(old_head, head_offset,
+                                             std::memory_order_release,
+                                             std::memory_order_relaxed));
+      }
+      head_offset = next_offset;
+    }
+  }
 }
 
+void Deque::evict_slot(int idx) noexcept {
+  registry_->pinned_epochs_[idx].value_.store(Registry::EBR_UNPINNED,
+                                              std::memory_order_release);
+  registry_->buffer_offsets_[idx].value_.store(NULL_OFFSET,
+                                               std::memory_order_release);
+  registry_->live_mask_.fetch_and(~(1ULL << idx), std::memory_order_acq_rel);
+}
 } // namespace moveitmoveit
