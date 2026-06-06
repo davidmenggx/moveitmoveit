@@ -10,17 +10,51 @@
 #include <cstring>
 #include <fcntl.h>
 #include <new>
+#include <signal.h>
 #include <stdexcept>
 #include <string>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <thread>
 #include <unistd.h>
 
 namespace moveitmoveit {
+// --- Seqlock helpers ---
+namespace {
+inline RingDescriptor load_descriptor(const Buffer *b) noexcept {
+  constexpr int MAX_SEQ_SPINS{1 << 16};
+  for (int spins{0}; spins < MAX_SEQ_SPINS; ++spins) {
+    const uint64_t s0{b->desc_seq_.load(std::memory_order_acquire)};
+
+    if (s0 & 1)
+      continue;
+
+    const uint64_t off{b->desc_offset_.load(std::memory_order_relaxed)};
+    const uint64_t cap{b->desc_capacity_.load(std::memory_order_relaxed)};
+    std::atomic_thread_fence(std::memory_order_acquire);
+
+    if (b->desc_seq_.load(std::memory_order_relaxed) == s0)
+      return RingDescriptor{.offset_ = off, .capacity_ = cap};
+  }
+  return RingDescriptor{.offset_ = NULL_OFFSET, .capacity_ = 0}; // give up
+}
+
+inline void store_descriptor(Buffer *b, const RingDescriptor &d) noexcept {
+  const uint64_t s{b->desc_seq_.load(std::memory_order_relaxed) + 1};
+  b->desc_seq_.store(s, std::memory_order_relaxed); // Begin
+
+  std::atomic_thread_fence(std::memory_order_release);
+
+  b->desc_offset_.store(d.offset_, std::memory_order_relaxed);
+  b->desc_capacity_.store(d.capacity_, std::memory_order_relaxed);
+  b->desc_seq_.store(s + 1, std::memory_order_release); // Publish
+}
+} // namespace
+
 Deque::Deque(std::string group_id, std::size_t total_memory_capacity_mb)
     : shm_name_{valid_shm_name(group_id)} {
-  shm_fd_ = shm_open(shm_name_.c_str(), O_CREAT | O_EXCL | O_RDWR, 0666);
+  shm_fd_ = shm_open(shm_name_.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
 
   // The first deque in the group needs to open shared memory and establish
   // Registry. Detect with flag O_EXCL.
@@ -109,6 +143,10 @@ Deque::Deque(std::string group_id, std::size_t total_memory_capacity_mb)
     }
   }
 
+  registry_->owner_pids_[queue_idx_].value_.store(
+      static_cast<uint64_t>(getpid()), std::memory_order_release);
+  beat();
+
   const uint64_t buf_offset{registry_->unallocated_memory_top_.fetch_add(
       (sizeof(Buffer) + CACHE_LINE_SIZE - 1) &
           ~(CACHE_LINE_SIZE - 1), // Align up
@@ -128,12 +166,13 @@ Deque::Deque(std::string group_id, std::size_t total_memory_capacity_mb)
   }
   RingDescriptor initial_descriptor{.offset_ = initial_buffer_offset,
                                     .capacity_ = initial_capacity};
-  my_buffer_->descriptor_.store(initial_descriptor, std::memory_order_relaxed);
+  store_descriptor(my_buffer_, initial_descriptor);
 
   registry_->num_active_processes_.fetch_add(1, std::memory_order_relaxed);
   process_count_incremented_ = true;
 
   rng_.seed(getpid());
+  fully_initialized_ = true;
 }
 
 Deque::~Deque() noexcept {
@@ -164,15 +203,14 @@ void Deque::put(const char *serialized_data, std::size_t size) {
       std::memory_order_relaxed)}; // This was acquire but switched to
                                    // relax since a stale result just results in
                                    // an unneeded grow, which is still correct.
-  RingDescriptor buf_desc{
-      my_buffer_->descriptor_.load(std::memory_order_relaxed)};
+  RingDescriptor buf_desc{load_descriptor(my_buffer_)};
   uint64_t capacity{buf_desc.capacity_};
 
   // Attempt to resize up if at capacity.
   if (bottom - top >= static_cast<int64_t>(capacity)) {
     if (!grow(capacity))
       throw std::bad_alloc();
-    buf_desc = my_buffer_->descriptor_.load(std::memory_order_relaxed);
+    buf_desc = load_descriptor(my_buffer_);
     capacity = buf_desc.capacity_;
   }
 
@@ -188,19 +226,14 @@ void Deque::put(const char *serialized_data, std::size_t size) {
 
   my_buffer_->bottom_.store(bottom + 1, std::memory_order_release);
 
-  if (ebr_cycles_since_advance_++ >= EBR_CYCLE_FORCE_ADVANCE) {
-    if (ebr_try_advance())
-      ebr_reclaim();
-    ebr_cycles_since_advance_ = 0;
-  }
+  ebr_periodic();
 }
 
 [[nodiscard]] bool Deque::try_put(const char *serialized_data,
                                   std::size_t size) {
   const int64_t bottom{my_buffer_->bottom_.load(std::memory_order_relaxed)};
   const int64_t top{my_buffer_->top_.load(std::memory_order_acquire)};
-  RingDescriptor buf_desc{
-      my_buffer_->descriptor_.load(std::memory_order_relaxed)};
+  RingDescriptor buf_desc{load_descriptor(my_buffer_)};
   const uint64_t capacity{buf_desc.capacity_};
 
   // Do not resize up if at capacity, return false.
@@ -219,11 +252,7 @@ void Deque::put(const char *serialized_data, std::size_t size) {
 
   my_buffer_->bottom_.store(bottom + 1, std::memory_order_release);
 
-  if (ebr_cycles_since_advance_++ >= EBR_CYCLE_FORCE_ADVANCE) {
-    if (ebr_try_advance())
-      ebr_reclaim();
-    ebr_cycles_since_advance_ = 0;
-  }
+  ebr_periodic();
 
   return true;
 }
@@ -237,16 +266,11 @@ void Deque::put(const char *serialized_data, std::size_t size) {
 
   int64_t top{my_buffer_->top_.load(std::memory_order_seq_cst)};
 
-  if (ebr_cycles_since_advance_++ >= EBR_CYCLE_FORCE_ADVANCE) {
-    if (ebr_try_advance())
-      ebr_reclaim();
-    ebr_cycles_since_advance_ = 0;
-  }
+  ebr_periodic();
 
   if (top <= bottom) {
     // Deque is nonempty
-    RingDescriptor desc{
-        my_buffer_->descriptor_.load(std::memory_order_relaxed)};
+    RingDescriptor desc{load_descriptor(my_buffer_)};
     const uint64_t capacity{desc.capacity_};
     auto *ring_buffer =
         offset_to_ptr<std::atomic<ObjectDescriptor>>(desc.offset_);
@@ -260,7 +284,7 @@ void Deque::put(const char *serialized_data, std::size_t size) {
     // Compete with possible thieves over the last item
     if (!my_buffer_->top_.compare_exchange_strong(
             top, top + 1, std::memory_order_seq_cst, std::memory_order_relaxed))
-      item = ABORT;
+      item = EMPTY;
 
     my_buffer_->bottom_.store(bottom + 1, std::memory_order_relaxed);
     return item;
@@ -377,8 +401,13 @@ void Deque::put(const char *serialized_data, std::size_t size) {
     return EMPTY;
   }
 
-  const RingDescriptor desc{
-      victim_buffer->descriptor_.load(std::memory_order_acquire)};
+  const RingDescriptor desc{load_descriptor(victim_buffer)};
+
+  if (desc.capacity_ == 0) {
+    ebr_unpin();
+    return ABORT;
+  }
+
   const uint64_t capacity{desc.capacity_};
   auto *ring_buffer =
       offset_to_ptr<std::atomic<ObjectDescriptor>>(desc.offset_);
@@ -410,7 +439,7 @@ void Deque::put(const char *serialized_data, std::size_t size) {
 [[nodiscard]] bool Deque::empty() const { return qsize() == 0; }
 
 [[nodiscard]] bool Deque::full() const {
-  RingDescriptor desc{my_buffer_->descriptor_.load(std::memory_order_relaxed)};
+  RingDescriptor desc{load_descriptor(my_buffer_)};
   return qsize() >= desc.capacity_;
 }
 
@@ -493,9 +522,9 @@ void Deque::free(uint64_t offset, uint64_t capacity) {
 void Deque::release(ObjectDescriptor &desc) noexcept {
   if (desc.status_ != ObjectStatus::Ok || desc.offset_ == NULL_OFFSET)
     return;
-  ebr_retire(desc.offset_, static_cast<uint64_t>(desc.size_));
-  if (ebr_try_advance())
-    ebr_reclaim();
+
+  free(desc.offset_, static_cast<uint64_t>(desc.size_));
+
   desc.status_ = ObjectStatus::Empty;
   desc.offset_ = NULL_OFFSET;
 }
@@ -505,8 +534,7 @@ void Deque::release(ObjectDescriptor &desc) noexcept {
 }
 
 [[nodiscard]] bool Deque::grow(uint64_t current_capacity) {
-  const RingDescriptor desc{
-      my_buffer_->descriptor_.load(std::memory_order_relaxed)};
+  const RingDescriptor desc{load_descriptor(my_buffer_)};
   const uint64_t old_offset{desc.offset_};
   const uint64_t old_size{current_capacity *
                           sizeof(std::atomic<ObjectDescriptor>)};
@@ -532,7 +560,7 @@ void Deque::release(ObjectDescriptor &desc) noexcept {
   }
 
   RingDescriptor new_desc{.offset_ = new_offset, .capacity_ = new_capacity};
-  my_buffer_->descriptor_.store(new_desc, std::memory_order_release);
+  store_descriptor(my_buffer_, new_desc);
 
   ebr_retire(old_offset, old_size);
   if (ebr_try_advance())
@@ -548,6 +576,8 @@ void Deque::cleanup() noexcept {
         NULL_OFFSET, std::memory_order_release);
     registry_->live_mask_.fetch_and(~(1ULL << queue_idx_),
                                     std::memory_order_release);
+    registry_->owner_pids_[queue_idx_].value_.store(NULL_OFFSET,
+                                                    std::memory_order_release);
 
     if (process_count_incremented_) {
       num_active_processes = registry_->num_active_processes_.fetch_sub(
@@ -587,7 +617,9 @@ void Deque::cleanup() noexcept {
     shm_fd_ = -1;
   }
 
-  if (num_active_processes == 1)
+  // A creator that fails at `ftruncate` or `mmap` leaves an invalid or
+  // improperly-sized memory region.
+  if (num_active_processes == 1 || (is_creator_ && !fully_initialized_))
     shm_unlink(shm_name_.c_str());
 }
 
@@ -600,6 +632,7 @@ void Deque::ebr_pin() noexcept {
     epoch = registry_->global_epoch_.load(std::memory_order_acquire);
     registry_->pinned_epochs_[queue_idx_].value_.store(
         epoch, std::memory_order_seq_cst);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
   } while (registry_->global_epoch_.load(std::memory_order_acquire) != epoch);
 }
 
@@ -610,16 +643,20 @@ void Deque::ebr_unpin() noexcept {
 }
 
 void Deque::ebr_retire(uint64_t offset, uint64_t size_bytes) noexcept {
+  uint64_t node_offset{allocate(sizeof(RetireNode))};
+
+  if (node_offset == NULL_OFFSET) {
+    if (ebr_try_advance())
+      ebr_reclaim();
+    node_offset = allocate(sizeof(RetireNode));
+    if (node_offset == NULL_OFFSET)
+      return; // Out of memory
+  }
+
   ebr_pin();
   const uint64_t epoch{
       registry_->global_epoch_.load(std::memory_order_acquire)};
   const int epoch_idx{static_cast<int>(epoch % EBR_EPOCHS)};
-
-  const uint64_t node_offset{allocate(sizeof(RetireNode))};
-  if (node_offset == NULL_OFFSET) {
-    ebr_unpin();
-    return; // Out of memory
-  }
 
   RetireNode *node{offset_to_ptr<RetireNode>(node_offset)};
   node->offset_ = offset;
@@ -642,7 +679,7 @@ void Deque::ebr_retire(uint64_t offset, uint64_t size_bytes) noexcept {
 
 bool Deque::ebr_try_advance() noexcept {
   uint64_t global{registry_->global_epoch_.load(std::memory_order_acquire)};
-  uint64_t mask{registry_->live_mask_.load(std::memory_order_acquire)};
+  const uint64_t mask{registry_->live_mask_.load(std::memory_order_acquire)};
   const uint64_t now{monotonic_ns()};
 
   uint64_t temp{mask};
@@ -656,14 +693,12 @@ bool Deque::ebr_try_advance() noexcept {
       continue;
 
     if (idx == queue_idx_)
-      return false; // Never evict ourselves
+      return false; // We are at an old epoch.
 
-    const uint64_t hb{registry_->heartbeats_[idx].last_seen_ns_.load(
-        std::memory_order_acquire)};
-    if (now - hb < Registry::EBR_PIN_TIMEOUT_NS)
+    if (slot_owner_alive(idx, now))
       return false; // Alive
 
-    evict_slot(idx);
+    reclaim_dead_slot(idx); // Dead
   }
 
   return registry_->global_epoch_.compare_exchange_strong(
@@ -707,11 +742,71 @@ void Deque::ebr_reclaim() noexcept {
   }
 }
 
-void Deque::evict_slot(int idx) noexcept {
-  registry_->pinned_epochs_[idx].value_.store(Registry::EBR_UNPINNED,
-                                              std::memory_order_release);
+bool Deque::slot_owner_alive(int idx, uint64_t now) noexcept {
+  // Avoid syscalls with heartbeat
+  const uint64_t hb{registry_->heartbeats_[idx].last_seen_ns_.load(
+      std::memory_order_acquire)};
+  if (now <= hb || now - hb < Registry::EBR_PIN_TIMEOUT_NS)
+    return true;
+
+  const uint64_t pid{
+      registry_->owner_pids_[idx].value_.load(std::memory_order_acquire)};
+
+  if (pid == 0)
+    return true; // slot is mid-registration, treat as alive (conservative)
+
+  if (::kill(static_cast<pid_t>(pid), 0) == 0)
+    return true;
+
+  if (errno == EPERM)
+    return true;
+
+  return false;
+}
+
+void Deque::reclaim_dead_slot(int idx) noexcept {
+  uint64_t pid{
+      registry_->owner_pids_[idx].value_.load(std::memory_order_acquire)};
+
+  if (pid == 0)
+    return;
+
+  if (!registry_->owner_pids_[idx].value_.compare_exchange_strong(
+          pid, 0, std::memory_order_acq_rel, std::memory_order_relaxed))
+    return;
+
+  // After this point you are the sole reclaimer.
   registry_->buffer_offsets_[idx].value_.store(NULL_OFFSET,
                                                std::memory_order_release);
-  registry_->live_mask_.fetch_and(~(1ULL << idx), std::memory_order_acq_rel);
+  registry_->pinned_epochs_[idx].value_.store(Registry::EBR_UNPINNED,
+                                              std::memory_order_release);
+  registry_->num_active_processes_.fetch_sub(1, std::memory_order_acq_rel);
+  registry_->live_mask_.fetch_and(~(1ULL << idx), std::memory_order_release);
+}
+
+void Deque::beat() noexcept {
+  registry_->heartbeats_[queue_idx_].last_seen_ns_.store(
+      monotonic_ns(), std::memory_order_release);
+}
+
+void Deque::ebr_reap_dead_slots(uint64_t now) noexcept {
+  uint64_t temp{registry_->live_mask_.load(std::memory_order_acquire) &
+                ~(1ULL << queue_idx_)};
+  while (temp) {
+    const int idx{std::countr_zero(temp)};
+    temp &= temp - 1;
+    if (!slot_owner_alive(idx, now))
+      reclaim_dead_slot(idx);
+  }
+}
+
+void Deque::ebr_periodic() noexcept {
+  if (ebr_cycles_since_advance_++ < EBR_CYCLE_FORCE_ADVANCE)
+    return;
+  ebr_cycles_since_advance_ = 0;
+  beat();
+  ebr_reap_dead_slots(monotonic_ns());
+  if (ebr_try_advance())
+    ebr_reclaim();
 }
 } // namespace moveitmoveit

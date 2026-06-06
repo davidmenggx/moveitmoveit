@@ -31,26 +31,39 @@ inline constexpr ObjectDescriptor ABORT{
 
 static_assert(std::atomic<ObjectDescriptor>::is_always_lock_free,
               "CRITICAL: ObjectDescriptor (128 bits) must be lock free");
+static_assert(sizeof(ObjectDescriptor) == 16,
+              "Double width CAS compares bitwise, no padding is acceptable");
 
 // TODO: Consider a more performant implementation for single type, such as
 // inlining the ObjectDescriptors.
 
 // Metadata for where the ring buffer is located in shared memory.
 struct alignas(16) RingDescriptor {
-  uint64_t offset_{0};
-  uint64_t capacity_{0};
+  std::atomic<uint64_t> offset_{0};
+  std::atomic<uint64_t> capacity_{0};
 
   bool operator==(const RingDescriptor &other) const noexcept = default;
-};
 
-static_assert(std::atomic<RingDescriptor>::is_always_lock_free,
-              "CRITICAL: RingDescriptor (128 bits) must be lock free");
+  RingDescriptor &operator=(RingDescriptor &&other) {
+    if (this != &other) {
+      offset_.store(other.offset_.load(std::memory_order_relaxed));
+      capacity_.store(other.capacity_.load(std::memory_order_relaxed));
+    }
+    return *this;
+  }
+};
 
 // Structure and algorithms inspired by David Chase and Yossi Lev, 2005.
 struct alignas(CACHE_LINE_SIZE) Buffer {
   alignas(CACHE_LINE_SIZE) std::atomic<int64_t> top_{0};
   alignas(CACHE_LINE_SIZE) std::atomic<int64_t> bottom_{0};
-  alignas(CACHE_LINE_SIZE) std::atomic<RingDescriptor> descriptor_{};
+
+  // The RingDescriptor is only changed in grow, which is only called by a
+  // single thread. Therefore we can use a seqlock instead of a 128 bit atomic
+  // for better performance.
+  alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> desc_seq_{0};
+  std::atomic<uint64_t> desc_offset_{0};
+  std::atomic<uint64_t> desc_capacity_{0};
 };
 
 // Memory allocation constants
@@ -68,6 +81,8 @@ struct alignas(16) FreeListHead {
 
 static_assert(std::atomic<FreeListHead>::is_always_lock_free,
               "CRITICAL: FreeListHead (128 bits) must be lock free");
+static_assert(sizeof(FreeListHead) == 16,
+              "Double width CAS compares bitwise, no padding is acceptable");
 
 // Metadata for tracking a retired buffer within shared memory.
 struct RetireNode {
@@ -112,7 +127,7 @@ struct Registry {
   PinnedEpoch pinned_epochs_[MAX_BUFFERS];
 
   // Prevent EBR from getting stuck when a process crashes.
-  static constexpr uint64_t EBR_PIN_TIMEOUT_NS{5'000'000'000ULL}; // 5s
+  static constexpr uint64_t EBR_PIN_TIMEOUT_NS{120'000'000'000ULL}; // 120s
   struct alignas(CACHE_LINE_SIZE) Heartbeat {
     std::atomic<uint64_t> last_seen_ns_{0};
   };
@@ -124,6 +139,11 @@ struct Registry {
                                           NULL_OFFSET};
   };
   ProcessRetireHeads retire_heads_[MAX_BUFFERS];
+
+  struct alignas(CACHE_LINE_SIZE) OwnerPid {
+    std::atomic<uint64_t> value_{0}; // 0 == unclaimed / mid-registration
+  };
+  OwnerPid owner_pids_[MAX_BUFFERS];
 };
 
 // Constructor retry constants
@@ -143,18 +163,42 @@ public:
 
   // Structure and algorithms inspired by David Chase and Yossi Lev, 2005.
 
-  // If the current buffer is full, try resize. Throws `bad_alloc` on failure.
+  /**
+   * @brief Attempts to add the specified item to the buffer. If the current
+   * buffer is full, try to resize up. Not thread safe.
+   *
+   * @param[in] serialized_data A pointer to the serialized object.
+   *
+   * @param[in] size The size of the object.
+   *
+   * @throws std::bad_alloc if out of memory, either for the specified item or
+   * when resizing the buffer up.
+   */
   void put(const char *serialized_data, std::size_t size);
 
   // Never resizes the buffer, returns false if capacity is reached.
+
+  /**
+   * @brief Attempts to add the specified item to the buffer. If the current
+   * buffer is full, returns false. Not thread safe.
+   *
+   * @param[in] serialized_data A pointer to the serialized object.
+   *
+   * @param[in] size The size of the object.
+   *
+   * @return bool True if the object was successfully pushed to the deque, false
+   * if the deque was empty and the object was not added.
+   *
+   * @throws std::bad_alloc if out of memory for the specified item.
+   */
   [[nodiscard]] bool try_put(const char *serialized_data, std::size_t size);
 
   /**
-   * @brief Attempts to remove and returns the newest item from this deque.
+   * @brief Attempts to remove and returns the newest item from this deque. Not
+   * thread safe.
    *
    * @return An `ObjectDescriptor` containing the removed newest item from this
-   * deque, `EMPTY` if this deque is empty, and `ABORT` on failure. Users should
-   * retry after `ABORT`.
+   * deque, and `EMPTY` if this deque is empty.
    */
   [[nodiscard]] ObjectDescriptor get();
 
@@ -164,6 +208,12 @@ public:
    * @param[in] target_longest [optional] If `true`, attempts to steal from the
    * deque with the most items. If `false`, chooses a random deque uniformly,
    * not necessarily nonempty. Largest size result unreliable. (Default: false)
+   *
+   * param[in] target_first [optional] If `true`, attempts to steal from the
+   * first deque, based on an internal ordering approximately equal to the order
+   * in which the deques were initialized. Since this ordering is unreliable,
+   * this parameter should primarily considered as a performance optimization.
+   * Overrides the value of `target_longest`. (Default: false)
    *
    * @return An `ObjectDescriptor` containing the removed oldest item from the
    * selected deque, `EMPTY` if there are no valid deques or the selected deque
@@ -242,7 +292,10 @@ private:
   Buffer *my_buffer_{nullptr};
   int64_t queue_idx_{-1};
   bool is_creator_{false};
+
+  // --- Initialization progress ---
   bool process_count_incremented_{false};
+  bool fully_initialized_{false};
 
   FastRNG rng_{};
 
@@ -264,7 +317,19 @@ private:
 
   void ebr_reclaim() noexcept;
 
-  // Remove a stalled process that times out.
-  void evict_slot(int idx) noexcept;
+  // --- Dead process reclamation helpers ---
+  // TODO: These rely on PID. PID re-use could be problematic, perhaps also
+  // store the time of creation to be ultra conservative.
+  [[nodiscard]] ObjectDescriptor make_descriptor(uint64_t block) const noexcept;
+
+  void beat() noexcept;
+
+  void ebr_periodic() noexcept;
+
+  [[nodiscard]] bool slot_owner_alive(int idx, uint64_t now) noexcept;
+
+  void reclaim_dead_slot(int idx) noexcept;
+
+  void ebr_reap_dead_slots(uint64_t now) noexcept;
 };
 } // namespace moveitmoveit

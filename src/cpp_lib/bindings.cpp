@@ -120,15 +120,13 @@ NB_MODULE(moveitmoveit_ext, m) {
 
       .def("get",
            [loads](Deque &d) {
-             ObjectDescriptor desc{ABORT};
+             ObjectDescriptor desc;
 
              {
                nb::gil_scoped_release release;
                desc = d.get();
              }
 
-             if (desc == ABORT)
-               throw AbortException();
              if (desc == EMPTY)
                throw EmptyException();
 
@@ -142,7 +140,7 @@ NB_MODULE(moveitmoveit_ext, m) {
       .def(
           "steal",
           [loads](Deque &d, bool target_longest, bool target_first) {
-            ObjectDescriptor desc{ABORT};
+            ObjectDescriptor desc;
 
             {
               nb::gil_scoped_release release;
