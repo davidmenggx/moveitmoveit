@@ -180,7 +180,9 @@ NB_MODULE(moveitmoveit_ext, m) {
             const char *p{static_cast<const char *>(view.buf)};
             std::size_t n{static_cast<std::size_t>(view.len)};
 
-            nb::gil_scoped_release release;
+            // Note: Do not release the GIL here as the buffer is mutable.
+            // nb::gil_scoped_release release;
+
             d.put(p, n);
           },
           nb::arg("data"))

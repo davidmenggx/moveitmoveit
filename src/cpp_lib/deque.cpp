@@ -54,7 +54,7 @@ inline void store_descriptor(Buffer *b, const RingDescriptor &d) noexcept {
 
 Deque::Deque(std::string group_id, std::size_t total_memory_capacity_mb)
     : shm_name_{valid_shm_name(group_id)} {
-  shm_fd_ = shm_open(shm_name_.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+  shm_fd_ = shm_open(shm_name_.c_str(), O_CREAT | O_EXCL | O_RDWR, 0666);
 
   // The first deque in the group needs to open shared memory and establish
   // Registry. Detect with flag O_EXCL.
@@ -118,7 +118,7 @@ Deque::Deque(std::string group_id, std::size_t total_memory_capacity_mb)
         throw std::runtime_error(
             "CRITICAL: Timed out waiting for creator to open Registry");
       }
-      std::this_thread::sleep_for(std::chrono::microseconds(100));
+      std::this_thread::sleep_for(std::chrono::microseconds(SLEEP_US));
     }
     registry_ = temp_reg;
 
@@ -177,6 +177,14 @@ Deque::Deque(std::string group_id, std::size_t total_memory_capacity_mb)
 
 Deque::~Deque() noexcept {
   ebr_unpin();
+
+  ObjectDescriptor d;
+  while ((d = get()) != EMPTY)
+    release(d);
+  RingDescriptor live{load_descriptor(my_buffer_)};
+  ebr_retire(live.offset_,
+             live.capacity_ * sizeof(std::atomic<ObjectDescriptor>));
+
   cleanup();
 }
 
@@ -420,8 +428,11 @@ void Deque::put(const char *serialized_data, std::size_t size) {
 
   ebr_unpin();
 
-  if (cas_ok && ebr_try_advance())
-    ebr_reclaim();
+  if (cas_ok && ++ebr_cycles_since_advance_ >= EBR_CYCLE_FORCE_ADVANCE) {
+    ebr_cycles_since_advance_ = 0;
+    if (ebr_try_advance())
+      ebr_reclaim();
+  }
 
   if (!cas_ok)
     return ABORT;
@@ -625,7 +636,7 @@ void Deque::cleanup() noexcept {
 
 void Deque::ebr_pin() noexcept {
   registry_->heartbeats_[queue_idx_].last_seen_ns_.store(
-      monotonic_ns(), std::memory_order_seq_cst);
+      monotonic_ns(), std::memory_order_release);
 
   uint64_t epoch{};
   do {
