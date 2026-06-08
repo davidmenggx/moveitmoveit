@@ -162,8 +162,8 @@ if __name__ == "__main__":
     
     NUM_MESSAGES = 10_000_000
     BUFFER_SIZE = 20_000
-    PRODUCERS = 8
-    CONSUMERS = 8
+    PRODUCERS = 16
+    CONSUMERS = 16
     
     mp_queue = mp.Queue()
     run_mpmc_throughput_test(
@@ -249,3 +249,10 @@ if __name__ == "__main__":
 # faster_fifo batched = 1,406,440.11 msgs/sec
 # moveitmoveit = 2,001,780.47 msgs/sec
 # moveitmoveit view = 2,179,138.19 msgs/sec
+
+# --- 16 producer, 16 consumer ---
+# multiprocessing = 90,089.73 msgs/sec 
+# faster_fifo = 448,635.57 msgs/sec
+# faster_fifo batched = 1,482,481.51 msgs/sec
+# moveitmoveit = 1,810,598.35 msgs/sec
+# moveitmoveit view = 2,221,516.12 msgs/sec
