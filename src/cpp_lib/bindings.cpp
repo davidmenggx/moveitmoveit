@@ -84,7 +84,7 @@ NB_MODULE(moveitmoveit_ext, m) {
 
   nb::class_<Deque>(m, "Deque")
       .def(nb::init<std::string, std::size_t>(), nb::arg("group_id"),
-           nb::arg("total_memory_capacity_mb") = 16384)
+           nb::arg("total_memory_capacity_mb") = 1048576)
 
       // --- Pickle methods ---
 

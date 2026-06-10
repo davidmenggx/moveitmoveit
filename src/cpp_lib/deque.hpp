@@ -153,7 +153,17 @@ inline constexpr int SLEEP_US{1'000};
 
 class Deque {
 public:
-  Deque(std::string group_id, std::size_t total_memory_capacity_mb = 16'384);
+  /**
+   * @param[in] group_id A unique identifier for the group that the Deque
+   * belongs to. Deques in the same group (constructed with the same group_id)
+   * are able to steal from each other. Group names should be reasonably
+   * distinct and not excessively long to avoid name mangling conflicts.
+   *
+   * @param[in] total_memory_capacity_mb The total amount of memory, in
+   * megabytes, for all Deques in the group. When memory capacity is reached,
+   * out of memory exceptions will be thrown.
+   */
+  Deque(std::string group_id, std::size_t total_memory_capacity_mb = 1'048'576);
   ~Deque() noexcept;
 
   Deque(const Deque &other) = delete;

@@ -25,7 +25,7 @@ See [testing methodology](https://github.com/davidmenggx/moveitmoveit/blob/main/
 
 ### Hardware prerequisites:
 
-This project relies heavily on *lock-free 128-bit atomic* synchronization primitives. The application *cannot be compiled* for generic x86_64 or base ARMv8-A platforms.
+This project relies heavily on *lock-free 128-bit atomic* synchronization primitives. The application *cannot be compiled* on generic x86_64 or base ARMv8-A platforms.
 - On x86_64, CPU must support the `cx16` instruction set extension (`cmpxchg16b`)
 - On ARM64, CPU must support `FEAT_LSE` and `FEAT_LSE2`
 
@@ -34,7 +34,7 @@ Both instructions *should be available on almost all modern x86_64 and ARM64 CPU
 ### Build prerequisites:
 - Linux
 - Python >= 3.9
-- C++ compiler support C++20 or higher
+- C++ compiler supporting C++20 or higher
 - CMake >= 3.18
 - Ninja >= 1.10
 
@@ -63,7 +63,7 @@ def run_worker(process_id: int):
             q.put(f"Task {i}")
             time.sleep(0.1)
             
-    # Process 1 acts as the consumer/stealer
+    # Process 1 acts as the consumer
     elif process_id == 1:
         time.sleep(0.2)  # Give process 0 a moment to populate its queue
         while True:
@@ -76,7 +76,6 @@ def run_worker(process_id: int):
                 break
 
 if __name__ == "__main__":
-    # Spin up two distinct OS processes
     p0 = multiprocessing.Process(target=run_worker, args=(0,))
     p1 = multiprocessing.Process(target=run_worker, args=(1,))
     
@@ -91,5 +90,7 @@ Also see [parallel merge sort example](https://github.com/davidmenggx/moveitmove
 
 ## Footnotes
 \* The comparison here is more nuanced in reality and should only be considered as a baseline for performance. Python's `multiprocessing.Queue` and [faster-fifo.Queue](https://github.com/alex-petrenko/faster-fifo) serve slightly different purposes than `moveitmoveit.Queue`, namely the single-queue versus queue-per-process architecture.
+
+MIT License
 
 Name: https://www.youtube.com/watch?v=hdcTmpvDO0I
